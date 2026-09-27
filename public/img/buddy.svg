@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Running buddy">
+  <g fill="#ffd400" stroke="#000" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="38" cy="11" r="7"/>
+    <path d="M33 21 L22 40 L31 42 L25 58 M33 21 L41 38 L52 44 M33 21 L20 22 L13 30 M34 23 L46 27 L52 20" fill="none" stroke="#000" stroke-width="9"/>
+    <path d="M33 21 L22 40 L31 42 L25 58 M33 21 L41 38 L52 44 M33 21 L20 22 L13 30 M34 23 L46 27 L52 20" fill="none" stroke="#ffd400" stroke-width="5"/>
+  </g>
+</svg>

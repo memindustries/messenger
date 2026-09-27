@@ -1,0 +1,21 @@
+{
+  "name": "buddy-messenger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A private, end-to-end encrypted, AIM-style instant messenger for small groups of friends.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "NODE_ENV=development node --disable-warning=ExperimentalWarning server/index.js",
+    "invite": "node --disable-warning=ExperimentalWarning server/cli.js invite",
+    "admin": "node --disable-warning=ExperimentalWarning server/cli.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
