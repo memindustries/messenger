@@ -53,7 +53,11 @@ npm run admin -- revoke MEM-DROP                           # kill it instantly i
 - Personal single-use invites from the **Invite** button keep working alongside campaign codes.
 - Sign-ups are limited to 30 per IP address per hour (`REGISTRATIONS_PER_HOUR`). The limit is set this high because many phones on the same carrier can share one IP.
 
-**Admins.** The first screen name ever created is the admin. Admins create and moderate public rooms from the **Chat** window. Add or remove admins with `npm run admin -- make-admin "Screen Name"` / `remove-admin`.
+**Admins.** Admins create and moderate public rooms from the **Chat** window. Three ways to be one:
+
+- **Configured names.** `ADMIN_SCREEN_NAMES` defaults to `mem`. These names are always admins, including existing accounts at the next restart. They're **reserved**: they can only be registered with an admin-issued single-use code (the first-run code in the logs, or `npm run invite`). A campaign code or a friend's invite can't claim them.
+- **The very first account** ever created.
+- **Promotion from the command line:** `npm run admin -- make-admin "Screen Name"`, and `remove-admin` to undo. `remove-admin` doesn't stick for configured names; change the variable instead.
 
 ## Deploy on Railway
 
@@ -66,7 +70,7 @@ npm run admin -- revoke MEM-DROP                           # kill it instantly i
    No accounts yet. Use this one-time invite code to create the first screen name:
        K7QM-2XPA-9RTF-HB3C
    ```
-5. Visit your domain, click **Get a Screen Name**, and use that code. That account becomes the admin.
+5. Visit your domain, click **Get a Screen Name**, and use that code to create **`mem`**. It's an admin automatically (see *Admins* below).
    After that, generate invites for friends from the **Invite** button, or make a campaign code (see above).
 
 No environment variables are required. The app detects Railway and then:
@@ -87,6 +91,7 @@ Railway handles HTTPS. `railway.json` sets the start command and a `/healthz` he
 | `INVITES_PER_USER` | `5` | Max unused invite codes per person. |
 | `INVITE_TTL_DAYS` | `7` | Invite code lifetime. |
 | `REGISTRATIONS_PER_HOUR` | `30` | Sign-ups allowed per IP per hour. |
+| `ADMIN_SCREEN_NAMES` | `mem` | Comma-separated screen names that are always admins and reserved for admin-issued invites. Set to empty to turn off. |
 | `ALLOWED_ORIGINS` | *(same host)* | Comma-separated origins allowed to call the API, if you serve from several domains. |
 
 ### Admin commands

@@ -157,13 +157,19 @@ export function createStore(db) {
     userCount: () => s.userCount.get().n,
     listUsers: () => s.listUsers.all(),
 
-    createUser: tx(({ inviteHash, display, salt, hash, publicKey, wrappedKey }) => {
-      if (!s.invite.get(inviteHash, Date.now())) return { error: 'invite' };
+    // adminNames: normalized screen names that are always admins. They're reserved:
+    // only an admin-issued single-use invite (CLI / first-run code) can claim them,
+    // so nobody can grab one with a campaign code or a friend's invite.
+    createUser: tx(({ inviteHash, display, salt, hash, publicKey, wrappedKey, adminNames = [] }) => {
+      const invite = s.invite.get(inviteHash, Date.now());
+      if (!invite) return { error: 'invite' };
       const norm = normalizeScreenName(display);
       if (s.userByNorm.get(norm)) return { error: 'taken' };
+      const reserved = adminNames.includes(norm);
+      if (reserved && (invite.created_by !== null || invite.max_uses !== 1)) return { error: 'reserved' };
       s.useInvite.run(inviteHash);
-      // The very first account runs the place.
-      const isAdmin = s.userCount.get().n === 0 ? 1 : 0;
+      // The very first account runs the place, as do the configured admin names.
+      const isAdmin = reserved || s.userCount.get().n === 0 ? 1 : 0;
       const r = s.insertUser.run(norm, display, salt, hash, publicKey, wrappedKey, isAdmin);
       return { id: Number(r.lastInsertRowid) };
     }),
@@ -194,6 +200,13 @@ export function createStore(db) {
     campaigns: () => s.campaigns.all(),
     revokeInvite: (code) => s.deleteInvite.run(sha256(normalizeInvite(code))).changes > 0,
     setAdmin: (id, on) => s.setAdmin.run(on ? 1 : 0, id),
+    // Make sure every configured admin name that exists is an admin.
+    promoteAdmins(adminNames) {
+      for (const norm of adminNames) {
+        const u = s.userByNorm.get(norm);
+        if (u && !u.is_admin) s.setAdmin.run(1, u.id);
+      }
+    },
     countInvites: (userId) => s.countInvites.get(userId, Date.now()).n,
     countAllInvites: () => db.prepare('SELECT COUNT(*) AS n FROM invites WHERE expires_at > ?').get(Date.now()).n,
 

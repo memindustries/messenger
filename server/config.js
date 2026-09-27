@@ -39,6 +39,9 @@ export function loadConfig(env = process.env) {
     offlineTtlMs: num(env.OFFLINE_MESSAGE_TTL_DAYS, 7) * 86400_000,
     maxOfflinePerUser: num(env.MAX_OFFLINE_PER_USER, 500),
     registrationsPerHourPerIp: num(env.REGISTRATIONS_PER_HOUR, 30),
+    // Screen names that are always admins (comma-separated). Reserved: they can only
+    // be registered with an admin-issued invite. Set ADMIN_SCREEN_NAMES="" to disable.
+    adminNames: (env.ADMIN_SCREEN_NAMES ?? 'mem').split(',').map((n) => n.replace(/\s+/g, '').toLowerCase()).filter(Boolean),
     invitesPerUser: num(env.INVITES_PER_USER, 5),
     inviteTtlMs: num(env.INVITE_TTL_DAYS, 7) * 86400_000,
   };

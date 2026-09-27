@@ -409,3 +409,44 @@ test('ownership passes on when a private room owner leaves', async () => {
   assert.equal(d.room.role, 'owner');
   assert.equal(d.room.epoch, 2);
 });
+
+// ---------------------------------------------------------------------------
+// Configured admin names (ADMIN_SCREEN_NAMES, default "mem")
+
+test('"mem" is reserved: campaign and friend invites cannot claim it, an admin invite can', async () => {
+  const friend = await register('Mem Fan');
+  const attempt = async (inviteCode) => {
+    const keys = await C.deriveAccountKeys('mem', 'long password 1', ITER);
+    const id = await C.generateIdentity(keys.wrapKey, keys.norm);
+    return req('POST', '/api/register', { screenName: 'MEM', inviteCode, authKey: keys.authKey, publicKey: id.publicKey, wrappedKey: id.wrappedKey });
+  };
+  app.store.createCampaign('MEMSQUAT', 50, 60_000);
+  assert.equal((await attempt('MEMSQUAT')).status, 409);
+  const personal = (await req('POST', '/api/invites', {}, friend.cookie)).body.code;
+  assert.equal((await attempt(personal)).status, 409);
+  // The rejected tries didn't burn the invites.
+  assert.equal(app.store.campaigns().find((c) => c.label === 'MEMSQUAT').uses, 0);
+
+  const { code } = app.store.createInvite(null, 60_000); // admin-issued (CLI / first-run)
+  const ok = await attempt(code);
+  assert.equal(ok.status, 201);
+  assert.equal(ok.body.isAdmin, true);
+  const me = await req('GET', '/api/me', null, ok.cookie);
+  assert.equal(me.body.isAdmin, true);
+});
+
+test('existing accounts with a configured admin name are promoted at startup', async () => {
+  const db = openDb(':memory:');
+  const cfg = { ...loadConfig({ NODE_ENV: 'development', ADMIN_SCREEN_NAMES: 'Big Boss' }), dbFile: ':memory:' };
+  const first = createApp({ config: { ...cfg, adminNames: [] }, db });
+  first.store.createInvite(null, 60_000);
+  const { code } = first.store.createInvite(null, 60_000);
+  first.store.createUser({ inviteHash: (await import('../server/store.js')).sha256(code.replace(/-/g, '')), display: 'Someone', salt: 's', hash: 'h', publicKey: '{}', wrappedKey: '{}' });
+  const { code: c2 } = first.store.createInvite(null, 60_000);
+  first.store.createUser({ inviteHash: (await import('../server/store.js')).sha256(c2.replace(/-/g, '')), display: 'Big Boss', salt: 's', hash: 'h', publicKey: '{}', wrappedKey: '{}' });
+  assert.equal(first.store.userByName('bigboss').is_admin, 0);
+  first.close();
+  const second = createApp({ config: cfg, db });
+  assert.equal(second.store.userByName('bigboss').is_admin, 1);
+  second.close();
+});

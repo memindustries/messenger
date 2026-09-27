@@ -20,6 +20,9 @@ if (store.userCount() === 0 && store.countAllInvites() === 0) {
   console.log('');
   console.log('  No accounts yet. Use this one-time invite code to create the first screen name:');
   console.log(`      ${code}`);
+  if (config.adminNames.length) {
+    console.log(`  Admin screen names (reserved for codes like this one): ${config.adminNames.join(', ')}`);
+  }
   console.log('  (Generate more later from inside the app, or with `npm run invite`.)');
   console.log('');
 }

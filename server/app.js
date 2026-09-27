@@ -124,6 +124,7 @@ class RateLimiter {
 
 export function createApp({ config, db }) {
   const store = createStore(db);
+  store.promoteAdmins(config.adminNames);
   const limiter = new RateLimiter();
   const hub = new Hub({ store, config });
   const csp = [
@@ -304,8 +305,9 @@ export function createApp({ config, db }) {
       const result = store.createUser({
         inviteHash: sha256(normalizeInvite(inviteCode)),
         display: screenName,
-        salt, hash, publicKey, wrappedKey,
+        salt, hash, publicKey, wrappedKey, adminNames: config.adminNames,
       });
+      if (result.error === 'reserved') throw new HttpError(409, 'That screen name is reserved.');
       if (result.error === 'invite') throw new HttpError(403, 'That invite code is invalid, expired or already used.');
       if (result.error === 'taken') throw new HttpError(409, 'That screen name is taken.');
       const token = store.createSession(result.id, config.sessionTtlMs);
