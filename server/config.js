@@ -38,7 +38,7 @@ export function loadConfig(env = process.env) {
     // Encrypted messages for offline buddies are held this long, then deleted. 0 disables.
     offlineTtlMs: num(env.OFFLINE_MESSAGE_TTL_DAYS, 7) * 86400_000,
     maxOfflinePerUser: num(env.MAX_OFFLINE_PER_USER, 500),
-    registrationsPerHourPerIp: num(env.REGISTRATIONS_PER_HOUR, 10),
+    registrationsPerHourPerIp: num(env.REGISTRATIONS_PER_HOUR, 30),
     invitesPerUser: num(env.INVITES_PER_USER, 5),
     inviteTtlMs: num(env.INVITE_TTL_DAYS, 7) * 86400_000,
   };

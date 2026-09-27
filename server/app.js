@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { Hub } from './hub.js';
+import { Hub, validEnvelope } from './hub.js';
 import {
   createStore, hashAuthKey, verifyAuthKey, normalizeScreenName, normalizeInvite, sha256,
 } from './store.js';
@@ -11,6 +11,9 @@ const AUTH_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
 const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const B64URL_RE = /^[A-Za-z0-9_-]+$/;
 const GROUP_RE = /^[\p{L}\p{N} '&._-]{1,24}$/u;
+const ROOM_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} '&!?.,#_-]{1,31}$/u;
+const MAX_PRIVATE_ROOM = 50;
+const MAX_OWNED_PRIVATE_ROOMS = 20;
 const MAX_BODY = 16 * 1024;
 
 const MIME = {
@@ -65,6 +68,23 @@ function parseWrappedKey(k) {
   } catch {
     throw new HttpError(400, 'Malformed key backup.');
   }
+}
+
+function parseRoomName(n) {
+  const name = typeof n === 'string' ? n.trim().replace(/\s+/g, ' ') : '';
+  if (!ROOM_NAME_RE.test(name)) throw new HttpError(400, 'Room names are 2-32 characters: letters, numbers, spaces and basic punctuation.');
+  return name;
+}
+
+function parseTopic(t) {
+  if (t === undefined || t === null) return '';
+  if (typeof t !== 'string') throw new HttpError(400, 'Invalid topic.');
+  return t.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120);
+}
+
+function requireEnvelope(env) {
+  if (!validEnvelope(env)) throw new HttpError(400, 'Malformed encrypted key.');
+  return JSON.stringify({ v: 1, salt: env.salt, iv: env.iv, ct: env.ct });
 }
 
 function parseGroup(g) {
@@ -227,6 +247,39 @@ export function createApp({ config, db }) {
     return other;
   }
 
+  // ---- Room helpers --------------------------------------------------------
+
+  function requireRoom(roomId, userId, { member = true } = {}) {
+    const room = Number.isInteger(roomId) ? store.room(roomId) : null;
+    if (!room) throw new HttpError(404, 'That room no longer exists.');
+    const membership = store.membership(room.id, userId);
+    if (member && membership?.status !== 'member') throw new HttpError(403, "You're not in that room.");
+    return { room, membership };
+  }
+
+  // Owners manage private rooms; admins manage public ones.
+  function requireModerator(room, membership, user) {
+    const ok = room.kind === 'public' ? !!user.is_admin : membership?.role === 'owner';
+    if (!ok) throw new HttpError(403, room.kind === 'public' ? 'Only admins can do that.' : 'Only the room owner can do that.');
+  }
+
+  function roomSummary(row) {
+    return {
+      id: row.id, kind: row.kind, name: row.name, topic: row.topic,
+      status: row.status, role: row.role, online: hub.roomOnlineCount(row.id),
+    };
+  }
+
+  function leaveRoom(roomId, user, { ban = false } = {}) {
+    const room = store.room(roomId);
+    const result = store.leaveRoom(roomId, user.id, { ban });
+    if (!room || !result || result.deleted) return result;
+    const newOwner = result.newOwnerId ? store.userById(result.newOwnerId)?.display : undefined;
+    hub.sendRoom(roomId, { t: 'roomLeft', room: roomId, screenName: user.display, newOwner });
+    if (room.kind === 'private') hub.sendRoom(roomId, { t: 'roomRekey', room: roomId, epoch: result.epoch });
+    return result;
+  }
+
   // Dummy hash used to keep response time the same for unknown screen names.
   const dummy = hashAuthKey('A'.repeat(43) + '=');
 
@@ -257,7 +310,7 @@ export function createApp({ config, db }) {
       if (result.error === 'taken') throw new HttpError(409, 'That screen name is taken.');
       const token = store.createSession(result.id, config.sessionTtlMs);
       setSessionCookie(res, token, config.sessionTtlMs);
-      sendJson(res, 201, { screenName });
+      sendJson(res, 201, { screenName, isAdmin: !!store.userById(result.id).is_admin });
     },
 
     'POST /api/login': async (req, res, body) => {
@@ -276,7 +329,9 @@ export function createApp({ config, db }) {
       if (old) store.deleteSession(old.tokenHash);
       const token = store.createSession(user.id, config.sessionTtlMs);
       setSessionCookie(res, token, config.sessionTtlMs);
-      sendJson(res, 200, { screenName: user.display, publicKey: user.public_key, wrappedKey: user.wrapped_key });
+      sendJson(res, 200, {
+        screenName: user.display, publicKey: user.public_key, wrappedKey: user.wrapped_key, isAdmin: !!user.is_admin,
+      });
     },
 
     // Public so it's safe to call on page load; ends the session if there is one.
@@ -294,6 +349,7 @@ export function createApp({ config, db }) {
       sendJson(res, 200, {
         screenName: session.user.display,
         publicKey: session.user.public_key,
+        isAdmin: !!session.user.is_admin,
       });
     },
 
@@ -319,6 +375,7 @@ export function createApp({ config, db }) {
         throw new HttpError(401, 'Incorrect password.');
       }
       const buddyIds = store.buddyIds(session.user.id);
+      for (const room of store.userRooms(session.user.id)) leaveRoom(room.id, session.user);
       store.deleteUser(session.user.id);
       for (const id of buddyIds) hub.send(id, { t: 'buddyRemoved', screenName: session.user.display });
       hub.disconnectUser(session.user.id);
@@ -398,6 +455,151 @@ export function createApp({ config, db }) {
       sendJson(res, 200, { ok: true });
     },
   };
+  Object.assign(routes, {
+    'GET /api/rooms': async (req, res, body, session) => {
+      const mine = store.userRooms(session.user.id).map(roomSummary);
+      const joined = new Set(mine.map((x) => x.id));
+      sendJson(res, 200, {
+        public: store.publicRooms().map((x) => ({ ...x, online: hub.roomOnlineCount(x.id), joined: joined.has(x.id) })),
+        mine: mine.filter((x) => x.status === 'member'),
+        invites: mine.filter((x) => x.status === 'invited'),
+      });
+    },
+
+    'POST /api/rooms/create': async (req, res, body, session) => {
+      const me = session.user;
+      limiter.hit(`room-create:${me.id}`, 20, 3600_000);
+      const kind = body.kind === 'public' ? 'public' : 'private';
+      const name = parseRoomName(body.name);
+      const topic = parseTopic(body.topic);
+      if (kind === 'public' && !me.is_admin) throw new HttpError(403, 'Only admins can create public rooms.');
+      if (kind === 'private' && store.ownedPrivateCount(me.id) >= MAX_OWNED_PRIVATE_ROOMS) {
+        throw new HttpError(429, `You can own up to ${MAX_OWNED_PRIVATE_ROOMS} private rooms.`);
+      }
+      // Private rooms start without a key; the creator's app sets one right away via /rekey.
+      const r = store.createRoom({ kind, name, topic, ownerId: me.id });
+      if (r.error === 'taken') throw new HttpError(409, 'A public room with that name already exists.');
+      sendJson(res, 201, { id: r.id });
+    },
+
+    'POST /api/rooms/get': async (req, res, body, session) => {
+      const { room, membership } = requireRoom(body.room, session.user.id, { member: false });
+      if (!membership) throw new HttpError(403, "You're not in that room.");
+      const everyone = store.roomMembers(room.id);
+      // Public rooms can be big: list who's here right now.
+      const shown = room.kind === 'public' ? everyone.filter((m) => hub.isOnline(m.id)) : everyone;
+      const key = room.kind === 'private' ? store.myRoomKey(room.id, session.user.id, room.key_epoch) : null;
+      sendJson(res, 200, {
+        room: {
+          id: room.id, kind: room.kind, name: room.name, topic: room.topic, epoch: room.key_epoch,
+          role: membership.role, status: membership.status, members: everyone.filter((m) => m.status === 'member').length,
+        },
+        members: shown.map((m) => ({
+          screenName: m.display, status: m.status, role: m.role, online: hub.isOnline(m.id),
+          publicKey: room.kind === 'private' ? m.public_key : undefined,
+        })),
+        key: key ? { from: key.from_display, fromPublicKey: key.from_public_key, envelope: JSON.parse(key.envelope) } : null,
+        hasKey: room.kind === 'private' ? store.roomHasKey(room.id, room.key_epoch) : true,
+      });
+    },
+
+    'POST /api/rooms/join': async (req, res, body, session) => {
+      const me = session.user;
+      const { room, membership } = requireRoom(body.room, me.id, { member: false });
+      if (room.kind !== 'public') throw new HttpError(403, 'Private rooms are invite-only.');
+      if (store.isRoomBanned(room.id, me.id)) throw new HttpError(403, "You've been removed from this room.");
+      if (!membership) {
+        store.joinPublic(room.id, me.id);
+        hub.sendRoom(room.id, { t: 'roomJoined', room: room.id, screenName: me.display, online: hub.isOnline(me.id) }, me.id);
+      }
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/rooms/leave': async (req, res, body, session) => {
+      requireRoom(body.room, session.user.id, { member: false });
+      leaveRoom(body.room, session.user);
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/rooms/invite': async (req, res, body, session) => {
+      const me = session.user;
+      limiter.hit(`room-invite:${me.id}`, 60, 3600_000);
+      const { room } = requireRoom(body.room, me.id);
+      if (room.kind !== 'private') throw new HttpError(400, 'Anyone can join public rooms from the room list.');
+      const other = otherUser(body.screenName, me.id);
+      if (!store.areBuddies(me.id, other.id)) throw new HttpError(403, 'You can only invite people on your Buddy List.');
+      if (store.isRoomBanned(room.id, other.id)) throw new HttpError(403, `${other.display} was removed from this room.`);
+      if (store.membership(room.id, other.id)) throw new HttpError(409, `${other.display} is already in this room (or invited).`);
+      if (store.roomMembers(room.id).length >= MAX_PRIVATE_ROOM) throw new HttpError(409, `Private rooms hold up to ${MAX_PRIVATE_ROOM} people.`);
+      const r = store.inviteToRoom(room.id, me.id, other.id, body.epoch, requireEnvelope(body.envelope));
+      if (r.error) throw new HttpError(409, 'The room key just changed. Try again.');
+      hub.send(other.id, { t: 'roomInvite', room: { id: room.id, kind: room.kind, name: room.name, topic: room.topic }, from: me.display });
+      hub.sendRoom(room.id, { t: 'roomInvited', room: room.id, screenName: other.display, by: me.display });
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/rooms/respond': async (req, res, body, session) => {
+      const me = session.user;
+      const { room, membership } = requireRoom(body.room, me.id, { member: false });
+      if (membership?.status !== 'invited') throw new HttpError(404, 'No pending invite to that room.');
+      if (body.accept === true) {
+        store.acceptRoomInvite(room.id, me.id);
+        hub.sendRoom(room.id, { t: 'roomJoined', room: room.id, screenName: me.display, online: hub.isOnline(me.id) }, me.id);
+      } else {
+        leaveRoom(room.id, me);
+      }
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/rooms/kick': async (req, res, body, session) => {
+      const me = session.user;
+      const { room, membership } = requireRoom(body.room, me.id, { member: !me.is_admin });
+      requireModerator(room, membership, me);
+      const other = otherUser(body.screenName, me.id);
+      if (!store.membership(room.id, other.id)) throw new HttpError(404, `${other.display} isn't in this room.`);
+      leaveRoom(room.id, other, { ban: true });
+      hub.send(other.id, { t: 'roomRemoved', room: room.id, name: room.name });
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/rooms/rekey': async (req, res, body, session) => {
+      const me = session.user;
+      const { room } = requireRoom(body.room, me.id);
+      if (room.kind !== 'private' || !Array.isArray(body.keys) || body.keys.length > MAX_PRIVATE_ROOM) {
+        throw new HttpError(400, 'Invalid key update.');
+      }
+      const entries = body.keys.map((k) => {
+        const u = typeof k?.screenName === 'string' ? store.userByName(k.screenName) : null;
+        if (!u) throw new HttpError(409, 'Room membership changed. Try again.');
+        return { userId: u.id, envelope: requireEnvelope(k.envelope) };
+      });
+      const r = store.submitRekey(room.id, me.id, body.epoch, entries);
+      if (r.error) throw new HttpError(409, 'Room membership changed. Try again.');
+      hub.sendRoom(room.id, { t: 'roomKey', room: room.id, epoch: body.epoch });
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/rooms/topic': async (req, res, body, session) => {
+      const me = session.user;
+      const { room, membership } = requireRoom(body.room, me.id, { member: !me.is_admin });
+      requireModerator(room, membership, me);
+      const topic = parseTopic(body.topic);
+      store.setTopic(room.id, topic);
+      hub.sendRoom(room.id, { t: 'roomTopic', room: room.id, topic, by: me.display });
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/rooms/close': async (req, res, body, session) => {
+      const me = session.user;
+      const { room, membership } = requireRoom(body.room, me.id, { member: !me.is_admin });
+      requireModerator(room, membership, me);
+      const people = store.roomMembers(room.id).map((m) => m.id);
+      store.closeRoom(room.id);
+      for (const id of people) hub.send(id, { t: 'roomClosed', room: room.id, name: room.name });
+      sendJson(res, 200, { ok: true });
+    },
+  });
+
   const PUBLIC_ROUTES = new Set(['POST /api/register', 'POST /api/login', 'POST /api/logout']);
 
   // -------------------------------------------------------------------------

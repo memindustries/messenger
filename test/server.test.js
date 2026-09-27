@@ -252,3 +252,160 @@ test('login is rate limited per screen name', async () => {
   for (let i = 0; i < 11; i++) last = await req('POST', '/api/login', { screenName: 'Rate Limited', authKey: bad.authKey });
   assert.equal(last.status, 429);
 });
+
+// ---------------------------------------------------------------------------
+// Campaign codes
+
+test('campaign codes work for many sign-ups up to the cap, and can be revoked', async () => {
+  app.store.createCampaign('STORY-DROP', 2, 60_000);
+  const signUp = async (name) => {
+    const keys = await C.deriveAccountKeys(name, 'long password 1', ITER);
+    const id = await C.generateIdentity(keys.wrapKey, keys.norm);
+    return req('POST', '/api/register', { screenName: name, inviteCode: 'story-drop', authKey: keys.authKey, publicKey: id.publicKey, wrappedKey: id.wrappedKey });
+  };
+  assert.equal((await signUp('Follower One')).status, 201);
+  assert.equal((await signUp('Follower Two')).status, 201);
+  assert.equal((await signUp('Follower Three')).status, 403);
+  app.store.createCampaign('OTHER-DROP', 10, 60_000);
+  assert.equal(app.store.revokeInvite('other-drop'), true);
+  assert.equal(app.store.campaigns().find((c) => c.label === 'STORY-DROP').uses, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Chat rooms
+
+async function makeAdmin(user) {
+  app.store.setAdmin(app.store.userByName(user.name).id, true);
+}
+
+test('only admins create public rooms; members chat in plaintext relayed live', async () => {
+  const admin = await register('Room Admin');
+  const guest = await register('Room Guest');
+  const r1 = await req('POST', '/api/rooms/create', { name: 'Lobby', kind: 'public' }, guest.cookie);
+  assert.equal(r1.status, 403);
+  await makeAdmin(admin);
+  const r2 = await req('POST', '/api/rooms/create', { name: 'Lobby', kind: 'public', topic: 'Say hi' }, admin.cookie);
+  assert.equal(r2.status, 201);
+  const room = r2.body.id;
+  assert.equal((await req('POST', '/api/rooms/create', { name: 'lobby', kind: 'public' }, admin.cookie)).status, 409);
+
+  const list = await req('GET', '/api/rooms', null, guest.cookie);
+  assert.equal(list.body.public.find((x) => x.id === room).joined, false);
+  const wa = await connect(admin);
+  const wg = await connect(guest);
+  // Not joined yet: can't talk.
+  wg.sendJson({ t: 'room', room, id: 'room-msg-001', text: 'hello?' });
+  assert.match((await wg.next((m) => m.t === 'error')).error, /not in that room/);
+  assert.equal((await req('POST', '/api/rooms/join', { room }, guest.cookie)).status, 200);
+  assert.equal((await wa.next((m) => m.t === 'roomJoined')).screenName, 'Room Guest');
+  wg.sendJson({ t: 'room', room, id: 'room-msg-002', text: 'hello everyone' });
+  const got = await wa.next((m) => m.t === 'room');
+  assert.equal(got.text, 'hello everyone');
+  assert.equal(got.from, 'Room Guest');
+
+  // Admin removes the guest; they can't rejoin.
+  assert.equal((await req('POST', '/api/rooms/kick', { room, screenName: 'Room Guest' }, admin.cookie)).status, 200);
+  assert.equal((await wg.next((m) => m.t === 'roomRemoved')).room, room);
+  assert.equal((await req('POST', '/api/rooms/join', { room }, guest.cookie)).status, 403);
+  wa.close();
+  wg.close();
+});
+
+async function privateRoom(owner, name = 'Secret Club') {
+  const r = await req('POST', '/api/rooms/create', { name, kind: 'private' }, owner.cookie);
+  assert.equal(r.status, 201);
+  const id = r.body.id;
+  // The creator sets the first key, bound to the real room id.
+  const raw = C.newRoomKey();
+  const envelope = await wrapFor(owner, owner, id, 1, raw);
+  const k = await req('POST', '/api/rooms/rekey', { room: id, epoch: 1, keys: [{ screenName: owner.name, envelope }] }, owner.cookie);
+  assert.equal(k.status, 200);
+  // And can unwrap it again later (e.g. after signing on on another device).
+  const d = (await req('POST', '/api/rooms/get', { room: id }, owner.cookie)).body;
+  const self = await C.deriveConversationKey(owner.privateKey, d.key.fromPublicKey);
+  assert.deepEqual(await C.unwrapRoomKey(self, { roomId: id, epoch: 1, from: d.key.from, to: owner.norm }, d.key.envelope), raw);
+  return { id, raw };
+}
+
+async function wrapFor(from, toUser, roomId, epoch, raw) {
+  const pair = await C.deriveConversationKey(from.privateKey, toUser.publicKey);
+  return C.wrapRoomKey(pair, { roomId, epoch, from: from.norm, to: toUser.norm }, raw);
+}
+
+test('private rooms: buddy-only invites, E2E relay, and a new key after someone leaves', async () => {
+  const owner = await register('Club Owner');
+  const pal = await register('Club Pal');
+  const stranger = await register('Club Stranger');
+  await befriend(owner, pal);
+  const { id: room, raw } = await privateRoom(owner);
+
+  // Can't invite non-buddies.
+  const env0 = await wrapFor(owner, stranger, room, 1, raw);
+  assert.equal((await req('POST', '/api/rooms/invite', { room, screenName: 'Club Stranger', epoch: 1, envelope: env0 }, owner.cookie)).status, 403);
+
+  const wp = await connect(pal);
+  const env1 = await wrapFor(owner, pal, room, 1, raw);
+  assert.equal((await req('POST', '/api/rooms/invite', { room, screenName: 'Club Pal', epoch: 1, envelope: env1 }, owner.cookie)).status, 200);
+  assert.equal((await wp.next((m) => m.t === 'roomInvite')).from, 'Club Owner');
+  assert.equal((await req('POST', '/api/rooms/respond', { room, accept: true }, pal.cookie)).status, 200);
+
+  // Pal fetches and unwraps the room key.
+  const detail = (await req('POST', '/api/rooms/get', { room }, pal.cookie)).body;
+  assert.equal(detail.room.epoch, 1);
+  assert.equal(detail.members.length, 2);
+  const pair = await C.deriveConversationKey(pal.privateKey, detail.key.fromPublicKey);
+  const palRaw = await C.unwrapRoomKey(pair, { roomId: room, epoch: 1, from: detail.key.from, to: pal.norm }, detail.key.envelope);
+  assert.deepEqual(palRaw, raw);
+
+  // Owner sends an encrypted message; server relays ciphertext only.
+  const wo = await connect(owner);
+  const key = await C.importRoomKey(raw);
+  const env = await C.encryptRoomMessage(key, { roomId: room, epoch: 1, from: owner.norm, id: 'club-msg-001' }, { text: 'top secret', ts: Date.now() });
+  wo.sendJson({ t: 'room', room, id: 'club-msg-001', epoch: 1, env });
+  const got = await wp.next((m) => m.t === 'room');
+  assert.ok(!JSON.stringify(got).includes('top secret'));
+  const plain = await C.decryptRoomMessage(await C.importRoomKey(palRaw), { roomId: room, epoch: got.epoch, from: got.from, id: got.id }, got.env);
+  assert.equal(plain.text, 'top secret');
+
+  // Stranger can't read the room or post to it.
+  assert.equal((await req('POST', '/api/rooms/get', { room }, stranger.cookie)).status, 403);
+
+  // Pal leaves: epoch advances, old key retired, owner must re-key.
+  assert.equal((await req('POST', '/api/rooms/leave', { room }, pal.cookie)).status, 200);
+  const rekey = await wo.next((m) => m.t === 'roomRekey');
+  assert.equal(rekey.epoch, 2);
+  const after = (await req('POST', '/api/rooms/get', { room }, owner.cookie)).body;
+  assert.equal(after.key, null);
+  assert.equal(after.hasKey, false);
+  wo.sendJson({ t: 'room', room, id: 'club-msg-002', epoch: 1, env });
+  assert.equal((await wo.next((m) => m.t === 'error')).rekey, true);
+
+  // Re-key must cover exactly the current members.
+  const raw2 = C.newRoomKey();
+  const selfEnv = await wrapFor(owner, owner, room, 2, raw2);
+  const bad = await req('POST', '/api/rooms/rekey', { room, epoch: 2, keys: [{ screenName: 'Club Owner', envelope: selfEnv }, { screenName: 'Club Pal', envelope: selfEnv }] }, owner.cookie);
+  assert.equal(bad.status, 409);
+  const good = await req('POST', '/api/rooms/rekey', { room, epoch: 2, keys: [{ screenName: 'Club Owner', envelope: selfEnv }] }, owner.cookie);
+  assert.equal(good.status, 200);
+  const again = await req('POST', '/api/rooms/rekey', { room, epoch: 2, keys: [{ screenName: 'Club Owner', envelope: selfEnv }] }, owner.cookie);
+  assert.equal(again.status, 409);
+
+  // Last member leaving deletes the room.
+  await req('POST', '/api/rooms/leave', { room }, owner.cookie);
+  assert.equal(app.store.room(room), undefined);
+  wo.close();
+  wp.close();
+});
+
+test('ownership passes on when a private room owner leaves', async () => {
+  const a = await register('Owner Leaves');
+  const b = await register('Heir Apparent');
+  await befriend(a, b);
+  const { id: room, raw } = await privateRoom(a, 'Succession');
+  await req('POST', '/api/rooms/invite', { room, screenName: b.name, epoch: 1, envelope: await wrapFor(a, b, room, 1, raw) }, a.cookie);
+  await req('POST', '/api/rooms/respond', { room, accept: true }, b.cookie);
+  await req('POST', '/api/rooms/leave', { room }, a.cookie);
+  const d = (await req('POST', '/api/rooms/get', { room }, b.cookie)).body;
+  assert.equal(d.room.role, 'owner');
+  assert.equal(d.room.epoch, 2);
+});

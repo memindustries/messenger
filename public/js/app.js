@@ -298,6 +298,12 @@ function newState(me) {
     away: { on: false, message: '' },
     autoReplied: new Set(),
     unread: new Map(), // norm -> count of unseen messages
+    rooms: new Map(), // room id -> { id, kind, name, topic, role, online, unread, mention }
+    roomInvites: [], // [{ id, name, from }]
+    roomLogs: new Map(), // room id -> recent lines, in memory only
+    roomWins: new Map(), // room id -> room window controller
+    roomKeys: new Map(), // room id -> { epoch, raw, key }
+    roomPending: new Map(), // msg id -> { room, text, retried }
     collapsed: new Set(prefs.get('collapsed', [])),
     selected: null,
     ws: null,
@@ -426,17 +432,17 @@ function showSignOn(notice) {
       if (mode === 'register') {
         setStep(2, 'Generating encryption keys…');
         const id = await C.generateIdentity(keys.wrapKey, keys.norm);
-        await api('POST', '/api/register', {
+        const reg = await api('POST', '/api/register', {
           screenName, inviteCode: invite.value.trim(), authKey: keys.authKey,
           publicKey: id.publicKey, wrappedKey: id.wrappedKey,
         });
-        me = { screenName, norm: keys.norm, publicKey: id.publicKey, wrappedKey: id.wrappedKey, privateKey: id.privateKey };
+        me = { screenName, norm: keys.norm, publicKey: id.publicKey, wrappedKey: id.wrappedKey, privateKey: id.privateKey, isAdmin: reg.isAdmin };
       } else {
         setStep(2, 'Verifying password…');
         const r = await api('POST', '/api/login', { screenName, authKey: keys.authKey });
         setStep(3, 'Unlocking encryption keys…');
         const privateKey = await C.unwrapIdentity(r.wrappedKey, keys.wrapKey, keys.norm);
-        me = { screenName: r.screenName, norm: keys.norm, publicKey: r.publicKey, wrappedKey: r.wrappedKey, privateKey };
+        me = { screenName: r.screenName, norm: keys.norm, publicKey: r.publicKey, wrappedKey: r.wrappedKey, privateKey, isAdmin: r.isAdmin };
       }
       prefs.set('screenName', save.checked ? me.screenName : undefined);
       pass.value = '';
@@ -473,6 +479,7 @@ async function startSession(me) {
   armBackTrap();
   try {
     await loadBuddies();
+    await loadRooms();
   } catch (err) {
     if (err.status === 401) return signOff('Please sign on again.');
   }
@@ -527,7 +534,10 @@ function connect() {
     state.wsRetry = 0;
     setConn('');
     if (state.away.on) wsSend({ t: 'status', away: true, awayMessage: state.away.message });
-    if (state.connectedBefore) loadBuddies().catch(() => {});
+    if (state.connectedBefore) {
+      loadBuddies().catch(() => {});
+      loadRooms().catch(() => {});
+    }
     state.connectedBefore = true;
   });
   ws.addEventListener('message', (e) => {
@@ -567,6 +577,10 @@ async function onServerMessage(msg) {
     case 'im':
       return receiveIm(msg);
     case 'sent': {
+      if (msg.room) {
+        S.roomPending.delete(msg.id);
+        return;
+      }
       const norm = S.pending.get(msg.id);
       S.pending.delete(msg.id);
       if (msg.queued && norm) {
@@ -576,6 +590,7 @@ async function onServerMessage(msg) {
       return;
     }
     case 'error': {
+      if (msg.room) return roomSendFailed(msg);
       const norm = S.pending.get(msg.id);
       S.pending.delete(msg.id);
       if (norm) S.ims.get(norm)?.sys(`Not delivered: ${msg.error}`, 'warn');
@@ -596,6 +611,18 @@ async function onServerMessage(msg) {
       }
       return refreshBuddy(b);
     }
+    case 'room':
+    case 'roomPresence':
+    case 'roomJoined':
+    case 'roomLeft':
+    case 'roomInvited':
+    case 'roomInvite':
+    case 'roomRekey':
+    case 'roomKey':
+    case 'roomTopic':
+    case 'roomClosed':
+    case 'roomRemoved':
+      return onRoomEvent(msg);
     case 'typing': {
       const im = S.ims.get(C.normalizeScreenName(msg.from));
       im?.typing(msg.on);
@@ -738,7 +765,7 @@ function setConn(text) {
 function buildBuddyList() {
   const win = makeWindow({
     title: `${S.me.screenName}'s Buddy List`, taskLabel: 'Buddies', cls: 'buddylist', closable: false,
-    x: Math.max(0, desktop.clientWidth - 260), y: 16,
+    x: Math.max(0, desktop.clientWidth - 280), y: 16,
   });
   S.buddyWin = win;
   blHeadName = h('div', { class: 'me', text: S.me.screenName });
@@ -756,10 +783,11 @@ function buildBuddyList() {
       btn('IM', () => { const b = selectedBuddy(); if (b) openIm(b); else addBuddyDialog(); }, 'Send an Instant Message'),
       btn('Add', addBuddyDialog, 'Add a buddy'),
       btn('Info', () => { const b = selectedBuddy(); if (b) buddyInfo(b); }, 'Buddy info & encryption'),
+      btn('Chat', roomsDialog, 'Chat rooms'),
       btn('Away', awayDialog, 'Set an away message'),
       btn('Invite', inviteDialog, 'Invite a friend'),
-      btn('Setup', setupDialog, 'Preferences & account')),
-    h('div', { class: 'row' }, h('span', { class: 'grow' }), btn('Sign Off', () => signOff()), h('span', { class: 'grow' })),
+      btn('Setup', setupDialog, 'Preferences & account'),
+      btn('Sign Off', () => signOff(), 'Sign off')),
   );
   blTree.addEventListener('keydown', (e) => {
     const items = [...blTree.querySelectorAll('.bl-item[data-norm]')];
@@ -826,6 +854,27 @@ function renderBuddyList() {
     }
   }
 
+  if (S.roomInvites.length && groupEl('#room-invites', 'Room Invites', S.roomInvites.length)) {
+    for (const inv of S.roomInvites) {
+      blTree.append(h('div', { class: 'bl-item', title: `From ${inv.from}` },
+        h('span', { class: 'name grow', text: `🔒 ${inv.name}` }),
+        h('button', { type: 'button', text: '✓', title: 'Join', onclick: () => respondRoomInvite(inv, true) }),
+        h('button', { type: 'button', text: '✗', title: 'Decline', onclick: () => respondRoomInvite(inv, false) })));
+    }
+  }
+
+  if (S.rooms.size && groupEl('#rooms', 'Chat Rooms', S.rooms.size)) {
+    const rooms = [...S.rooms.values()].sort((a, c) => a.name.localeCompare(c.name));
+    for (const room of rooms) {
+      const el = h('div', { class: `bl-item bl-room${room.mention ? ' mention' : ''}`, role: 'treeitem' },
+        h('span', { class: 'name', text: `${room.kind === 'private' ? '🔒' : '#'} ${room.name}` }),
+        h('span', { class: 'tag', text: `(${room.online})` }),
+        room.unread ? h('span', { class: 'badge', text: room.mention ? '@' : String(room.unread) }) : null);
+      el.addEventListener(isTouch() ? 'click' : 'dblclick', () => openRoom(room.id));
+      blTree.append(el);
+    }
+  }
+
   const all = [...S.buddies.values()];
   const groups = new Map();
   for (const b of all) {
@@ -867,8 +916,8 @@ function renderBuddyList() {
   if (S.outgoing.length && groupEl('#outgoing', 'Awaiting Reply', S.outgoing.length)) {
     for (const name of S.outgoing) blTree.append(h('div', { class: 'bl-item offline', text: name }));
   }
-  if (!all.length && !S.incoming.length && !S.outgoing.length) {
-    blTree.append(h('p', { class: 'hint', text: 'Your Buddy List is empty. Click "Add" to add a friend by screen name, or "Invite" to get a friend signed up.' }));
+  if (!all.length && !S.incoming.length && !S.outgoing.length && !S.rooms.size) {
+    blTree.append(h('p', { class: 'hint', text: 'Your Buddy List is empty. Tap "Add" to add a friend by screen name, "Chat" to find a chat room, or "Invite" to get a friend signed up.' }));
   }
   blTree.scrollTop = scroll;
 }
@@ -1033,6 +1082,698 @@ function createIm(buddy, { background = false } = {}) {
   im.sys('Messages in this window are end-to-end encrypted and are not saved anywhere. Closing the window erases the conversation.');
   S.ims.set(norm, im);
   return im;
+}
+
+// ===========================================================================
+// Chat rooms
+//
+// Public rooms: anyone can join from the directory; messages are protected by
+// HTTPS only and relayed live (never stored). Private rooms: invite-only and
+// end-to-end encrypted with a shared room key (see crypto.js). Neither keeps
+// history; what you see lives in this tab's memory until you close the window.
+
+const MAX_ROOM_TEXT = 2000;
+const MAX_ROOM_LOG = 300;
+
+async function loadRooms() {
+  const data = await api('GET', '/api/rooms');
+  const next = new Map();
+  for (const r of data.mine) {
+    const prev = S.rooms.get(r.id);
+    next.set(r.id, { ...r, unread: prev?.unread ?? 0, mention: prev?.mention ?? false });
+  }
+  for (const id of S.rooms.keys()) if (!next.has(id)) forgetRoom(id);
+  S.rooms = next;
+  S.roomInvites = data.invites.map((r) => ({ id: r.id, name: r.name, from: S.roomInvites.find((x) => x.id === r.id)?.from ?? 'a buddy' }));
+  renderBuddyList();
+  for (const [id, w] of S.roomWins) w.update(S.rooms.get(id));
+  return data;
+}
+
+let roomsRefreshTimer = null;
+function refreshRoomsSoon() {
+  clearTimeout(roomsRefreshTimer);
+  roomsRefreshTimer = setTimeout(() => { if (S) loadRooms().catch(() => {}); }, 400);
+}
+
+function forgetRoom(id) {
+  S.rooms.delete(id);
+  S.roomKeys.delete(id);
+  S.roomLogs.delete(id);
+  S.roomWins.get(id)?.win.close();
+}
+
+const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function mentionsMe(text) {
+  const names = [S.me.screenName, S.me.norm].map(escapeRe).join('|');
+  return new RegExp(`(^|[^\\p{L}\\p{N}])@?(${names})(?![\\p{L}\\p{N}])`, 'iu').test(text);
+}
+
+function isBlockedName(name) {
+  const n = C.normalizeScreenName(name);
+  return S.blocked.some((x) => C.normalizeScreenName(x) === n);
+}
+
+// ---- Room keys (private rooms) ---------------------------------------------
+
+// A buddy's key as pinned on this device; refuse to use a different one.
+function checkAgainstPins(screenName, publicKey) {
+  const b = S.buddies.get(C.normalizeScreenName(screenName));
+  if (b && (b.keyStatus === 'changed' || C.canonicalPublicKey(b.publicKey) !== C.canonicalPublicKey(publicKey))) {
+    throw new Error(`${screenName}'s encryption key doesn't match the one you have for them. Check Buddy Info before continuing.`);
+  }
+}
+
+async function wrapRoomKeyFor(roomId, epoch, raw, screenName, publicKey) {
+  checkAgainstPins(screenName, publicKey);
+  const pair = await C.deriveConversationKey(S.me.privateKey, publicKey);
+  return C.wrapRoomKey(pair, { roomId, epoch, from: S.me.norm, to: C.normalizeScreenName(screenName) }, raw);
+}
+
+// Make sure we hold the current key for a private room. With create: true it
+// also generates a new key when the room needs one (just created, or someone
+// left). Concurrent calls for the same room share one request. Returns details.
+const roomKeyLoads = new Map();
+function ensureRoomKey(roomId, { create = true } = {}) {
+  const k = `${roomId}:${create}`;
+  if (!roomKeyLoads.has(k)) {
+    roomKeyLoads.set(k, loadRoomKey(roomId, create).finally(() => roomKeyLoads.delete(k)));
+  }
+  return roomKeyLoads.get(k);
+}
+
+async function loadRoomKey(roomId, create, attempt = 0) {
+  const d = await api('POST', '/api/rooms/get', { room: roomId });
+  if (d.room.kind !== 'private' || d.room.status !== 'member') return d;
+  const cached = S.roomKeys.get(roomId);
+  if (cached?.epoch === d.room.epoch) return d;
+  if (d.key) {
+    checkAgainstPins(d.key.from, d.key.fromPublicKey);
+    const pair = await C.deriveConversationKey(S.me.privateKey, d.key.fromPublicKey);
+    const raw = await C.unwrapRoomKey(pair, { roomId, epoch: d.room.epoch, from: d.key.from, to: S.me.norm }, d.key.envelope);
+    S.roomKeys.set(roomId, { epoch: d.room.epoch, raw, key: await C.importRoomKey(raw) });
+    return d;
+  }
+  if (!create) return d;
+  if (d.hasKey || attempt > 3) throw new Error('Could not get the key for this room.');
+  // Nobody has made a key for this epoch yet: make one and share it with everyone in the room.
+  const raw = C.newRoomKey();
+  const keys = await Promise.all(d.members.map(async (m) => ({
+    screenName: m.screenName,
+    envelope: await wrapRoomKeyFor(roomId, d.room.epoch, raw, m.screenName, m.publicKey),
+  })));
+  try {
+    await api('POST', '/api/rooms/rekey', { room: roomId, epoch: d.room.epoch, keys });
+    S.roomKeys.set(roomId, { epoch: d.room.epoch, raw, key: await C.importRoomKey(raw) });
+    return d;
+  } catch (err) {
+    if (err.status !== 409) throw err;
+    return loadRoomKey(roomId, create, attempt + 1); // someone else beat us to it, or membership changed
+  }
+}
+
+// ---- Sending & receiving -----------------------------------------------------
+
+async function sendRoomMessage(roomId, text) {
+  const room = S.rooms.get(roomId);
+  if (!room) return false;
+  const id = C.randomId();
+  let msg;
+  if (room.kind === 'private') {
+    await ensureRoomKey(roomId);
+    const k = S.roomKeys.get(roomId);
+    const env = await C.encryptRoomMessage(k.key, { roomId, epoch: k.epoch, from: S.me.norm, id }, { text, ts: Date.now() });
+    msg = { t: 'room', room: roomId, id, epoch: k.epoch, env };
+  } else {
+    msg = { t: 'room', room: roomId, id, text };
+  }
+  if (!wsSend(msg)) {
+    roomLog(roomId, { sys: 'Not connected. Your message was not sent.', cls: 'warn' });
+    return false;
+  }
+  const retried = S.roomPending.get(id)?.retried ?? false;
+  S.roomPending.set(id, { room: roomId, text, retried });
+  roomLog(roomId, { from: S.me.screenName, side: 'me', text, ts: Date.now() });
+  sounds.imOut();
+  return true;
+}
+
+async function roomSendFailed(msg) {
+  const p = S.roomPending.get(msg.id);
+  S.roomPending.delete(msg.id);
+  if (msg.rekey && p && !p.retried) {
+    // The key changed between typing and sending: fetch the new key and resend once.
+    S.roomKeys.delete(msg.room);
+    try {
+      await ensureRoomKey(msg.room);
+      const id = C.randomId();
+      const k = S.roomKeys.get(msg.room);
+      const env = await C.encryptRoomMessage(k.key, { roomId: msg.room, epoch: k.epoch, from: S.me.norm, id }, { text: p.text, ts: Date.now() });
+      S.roomPending.set(id, { ...p, retried: true });
+      wsSend({ t: 'room', room: msg.room, id, epoch: k.epoch, env });
+      return;
+    } catch { /* fall through to the error line */ }
+  }
+  roomLog(msg.room, { sys: `Not delivered: ${msg.error}`, cls: 'warn' });
+}
+
+async function receiveRoomMessage(m) {
+  const room = S.rooms.get(m.room);
+  if (!room || isBlockedName(m.from)) return;
+  let text;
+  let ts = m.ts ?? Date.now();
+  if (m.env) {
+    let k = S.roomKeys.get(m.room);
+    if (k?.epoch !== m.epoch) {
+      try {
+        await ensureRoomKey(m.room, { create: false });
+      } catch { /* reported below */ }
+      k = S.roomKeys.get(m.room);
+    }
+    try {
+      const p = await C.decryptRoomMessage(k.key, { roomId: m.room, epoch: m.epoch, from: m.from, id: m.id }, m.env);
+      if (typeof p.text !== 'string') return;
+      text = p.text.slice(0, MAX_ROOM_TEXT);
+      ts = typeof p.ts === 'number' ? p.ts : ts;
+    } catch {
+      roomLog(m.room, { sys: `A message from ${m.from} could not be decrypted.`, cls: 'warn' });
+      return;
+    }
+  } else {
+    text = String(m.text).slice(0, MAX_ROOM_TEXT);
+  }
+  const mention = mentionsMe(text);
+  roomLog(m.room, { from: m.from, side: 'them', text, ts, mention });
+  const w = S.roomWins.get(m.room);
+  if (!w?.win.active) {
+    room.unread = (room.unread ?? 0) + 1;
+    if (mention) {
+      room.mention = true;
+      sounds.imIn();
+      titleFlash(`${m.from} in ${room.name}`);
+      if (isSmall() && !document.hidden) toast(`${m.from} in ${room.name}: ${text.slice(0, 80)}`, () => openRoom(room.id));
+    }
+    w?.updateTask();
+    renderBuddyList();
+  }
+}
+
+// Append a line to a room's in-memory log and its window, if open.
+function roomLog(roomId, line) {
+  let log = S.roomLogs.get(roomId);
+  if (!log) S.roomLogs.set(roomId, (log = []));
+  log.push(line);
+  if (log.length > MAX_ROOM_LOG) log.splice(0, log.length - MAX_ROOM_LOG);
+  S.roomWins.get(roomId)?.append(line);
+}
+
+async function onRoomEvent(msg) {
+  const id = msg.room?.id ?? msg.room;
+  const room = S.rooms.get(id);
+  const w = S.roomWins.get(id);
+  switch (msg.t) {
+    case 'room':
+      return receiveRoomMessage(msg);
+    case 'roomPresence':
+      if (w) {
+        roomLog(id, { sys: `${msg.screenName} has ${msg.online ? 'entered' : 'left'} the room.` });
+        if (msg.online) sounds.doorOpen();
+        else sounds.doorClose();
+        w.reload();
+      }
+      return refreshRoomsSoon();
+    case 'roomJoined':
+      if (w) {
+        roomLog(id, { sys: `${msg.screenName} joined the room.` });
+        sounds.doorOpen();
+        w.reload();
+      }
+      return refreshRoomsSoon();
+    case 'roomLeft':
+      if (room && msg.newOwner && C.normalizeScreenName(msg.newOwner) === S.me.norm) room.role = 'owner';
+      if (w) {
+        roomLog(id, { sys: `${msg.screenName} left the room.` });
+        if (msg.newOwner) roomLog(id, { sys: `${msg.newOwner} is now the room owner.` });
+        sounds.doorClose();
+        w.reload();
+      }
+      return refreshRoomsSoon();
+    case 'roomInvited':
+      if (w) {
+        roomLog(id, { sys: `${msg.by} invited ${msg.screenName}.` });
+        w.reload();
+      }
+      return undefined;
+    case 'roomInvite':
+      if (!S.roomInvites.some((x) => x.id === id)) S.roomInvites.push({ id, name: msg.room.name, from: msg.from });
+      sounds.imIn();
+      if (isSmall()) toast(`${msg.from} invited you to the private room "${msg.room.name}"`, () => S.buddyWin.focus());
+      return renderBuddyList();
+    case 'roomRekey':
+      // Someone left: the old key is retired. The owner makes a new one right away;
+      // if the owner isn't around, whoever sends the next message does.
+      S.roomKeys.delete(id);
+      if (room?.role === 'owner') ensureRoomKey(id).catch(() => {});
+      return undefined;
+    case 'roomKey':
+      if (S.roomKeys.get(id)?.epoch !== msg.epoch) {
+        S.roomKeys.delete(id);
+        if (w) ensureRoomKey(id, { create: false }).catch(() => {});
+      }
+      return undefined;
+    case 'roomTopic':
+      if (room) room.topic = msg.topic;
+      roomLog(id, { sys: `${msg.by} changed the topic to: ${msg.topic || '(none)'}` });
+      w?.update(room);
+      return undefined;
+    case 'roomClosed':
+    case 'roomRemoved':
+      S.roomInvites = S.roomInvites.filter((x) => x.id !== id);
+      if (room || w) {
+        forgetRoom(id);
+        alertBox('Chat Room', msg.t === 'roomClosed' ? `"${msg.name}" was closed.` : `You were removed from "${msg.name}".`);
+      }
+      return renderBuddyList();
+    default:
+      return undefined;
+  }
+}
+
+// ---- Joining, leaving, inviting ------------------------------------------------
+
+async function respondRoomInvite(inv, accept) {
+  try {
+    await api('POST', '/api/rooms/respond', { room: inv.id, accept });
+    S.roomInvites = S.roomInvites.filter((x) => x.id !== inv.id);
+    await loadRooms();
+    if (accept) openRoom(inv.id);
+  } catch (err) {
+    alertBox('Room Invite', err.message);
+    loadRooms().catch(() => {});
+  }
+}
+
+async function joinPublicRoom(id) {
+  await api('POST', '/api/rooms/join', { room: id });
+  await loadRooms();
+  openRoom(id);
+}
+
+async function leaveRoom(id) {
+  const room = S.rooms.get(id);
+  if (!room) return;
+  const extra = room.kind === 'private' && room.role === 'owner' ? ' Someone else in the room will become the owner.' : '';
+  if (!confirm(`Leave "${room.name}"?${extra}`)) return;
+  try {
+    await api('POST', '/api/rooms/leave', { room: id });
+    forgetRoom(id);
+    renderBuddyList();
+  } catch (err) {
+    alertBox('Leave Room', err.message);
+  }
+}
+
+function inviteToRoomDialog(roomId) {
+  const room = S.rooms.get(roomId);
+  if (!room) return;
+  dialog(`room-invite:${roomId}`, { title: `Invite to ${room.name}` }, async (win) => {
+    const msg = h('p', { class: 'small', role: 'status' });
+    const list = h('div', { class: 'list sunken' });
+    const go = h('button', { type: 'button', text: 'Invite' });
+    win.body.append(
+      h('p', { class: 'hint', text: 'Pick buddies to invite. Each one gets their own encrypted copy of the room key.' }),
+      list, msg,
+      h('div', { class: 'row end' }, go, h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
+    let details;
+    try {
+      details = await ensureRoomKey(roomId);
+    } catch (err) {
+      msg.className = 'small error';
+      msg.textContent = err.message;
+      return;
+    }
+    const inRoom = new Set(details.members.map((m) => C.normalizeScreenName(m.screenName)));
+    const candidates = [...S.buddies.values()].filter((b) => !inRoom.has(b.norm)).sort((a, c) => a.norm.localeCompare(c.norm));
+    if (!candidates.length) list.append(h('div', { class: 'muted small', text: 'All your buddies are already here.' }));
+    const boxes = candidates.map((b) => {
+      const box = h('input', { type: 'checkbox', value: b.norm });
+      list.append(h('label', { class: 'check' }, box, b.screenName, b.online ? '' : h('span', { class: 'muted small', text: ' (offline)' })));
+      return box;
+    });
+    go.addEventListener('click', async () => {
+      const picked = boxes.filter((x) => x.checked).map((x) => S.buddies.get(x.value));
+      if (!picked.length) return;
+      go.disabled = true;
+      const done = [];
+      const failed = [];
+      for (const b of picked) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await ensureRoomKey(roomId);
+            const k = S.roomKeys.get(roomId);
+            const envelope = await wrapRoomKeyFor(roomId, k.epoch, k.raw, b.screenName, b.publicKey);
+            await api('POST', '/api/rooms/invite', { room: roomId, screenName: b.screenName, epoch: k.epoch, envelope });
+            done.push(b.screenName);
+            break;
+          } catch (err) {
+            if (err.status === 409 && attempt === 0) {
+              S.roomKeys.delete(roomId);
+              continue;
+            }
+            failed.push(`${b.screenName}: ${err.message}`);
+            break;
+          }
+        }
+      }
+      msg.className = failed.length ? 'small error' : 'small ok';
+      msg.textContent = [done.length ? `Invited ${done.join(', ')}.` : '', ...failed].filter(Boolean).join(' ');
+      go.disabled = false;
+      if (!failed.length) setTimeout(() => win.close(), 800);
+    });
+  });
+}
+
+function roomMemberDialog(roomId, member, canModerate) {
+  const norm = C.normalizeScreenName(member.screenName);
+  if (norm === S.me.norm) return;
+  const buddy = S.buddies.get(norm);
+  dialog(`room-member:${roomId}:${norm}`, { title: member.screenName }, (win) => {
+    const room = S.rooms.get(roomId);
+    win.body.append(
+      h('p', {}, h('strong', { text: member.screenName }), member.role === 'owner' ? ' — room owner' : '', member.status === 'invited' ? ' — invited' : ''),
+      h('div', { class: 'row wrap end' },
+        buddy ? h('button', { type: 'button', text: 'Send IM', onclick: () => { win.close(); openIm(buddy); } })
+          : h('button', {
+            type: 'button', text: 'Add Buddy',
+            onclick: async () => {
+              try {
+                const r = await api('POST', '/api/buddies/request', { screenName: member.screenName });
+                if (r.status !== 'accepted' && r.screenName && !S.outgoing.includes(r.screenName)) S.outgoing.push(r.screenName);
+                renderBuddyList();
+                win.close();
+              } catch (err) { alertBox('Add Buddy', err.message); }
+            },
+          }),
+        canModerate ? h('button', {
+          type: 'button', text: 'Remove from room',
+          onclick: async () => {
+            if (!confirm(`Remove ${member.screenName} from "${room?.name}"? They won't be able to come back.`)) return;
+            try {
+              await api('POST', '/api/rooms/kick', { room: roomId, screenName: member.screenName });
+              win.close();
+            } catch (err) { alertBox('Remove', err.message); }
+          },
+        }) : null,
+        h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
+  });
+}
+
+function roomOptionsDialog(roomId) {
+  const room = S.rooms.get(roomId);
+  if (!room) return;
+  const canModerate = room.kind === 'public' ? S.me.isAdmin : room.role === 'owner';
+  dialog(`room-options:${roomId}`, { title: `${room.name} Options` }, (win) => {
+    const topic = h('input', { type: 'text', maxlength: '120', value: room.topic || '' });
+    win.body.append(
+      h('p', { class: 'hint', text: room.kind === 'private'
+        ? '🔒 Private room: invite-only and end-to-end encrypted. Nothing is saved; you only see what’s said while you’re here.'
+        : '# Public room: anyone on Mem Messenger can join. Messages are protected in transit but are not end-to-end encrypted. Nothing is saved.' }),
+      canModerate ? h('label', { class: 'field' }, 'Topic', topic) : (room.topic ? h('p', {}, 'Topic: ', room.topic) : null),
+      h('div', { class: 'row wrap end' },
+        canModerate ? h('button', {
+          type: 'button', text: 'Save Topic',
+          onclick: async () => {
+            try {
+              await api('POST', '/api/rooms/topic', { room: roomId, topic: topic.value });
+              win.close();
+            } catch (err) { alertBox('Topic', err.message); }
+          },
+        }) : null,
+        room.kind === 'private' ? h('button', { type: 'button', text: 'Invite Buddies', onclick: () => { win.close(); inviteToRoomDialog(roomId); } }) : null,
+        h('button', { type: 'button', text: 'Leave Room', onclick: () => { win.close(); leaveRoom(roomId); } }),
+        canModerate ? h('button', {
+          type: 'button', text: 'Close Room',
+          onclick: async () => {
+            if (!confirm(`Close "${room.name}" for everyone?`)) return;
+            try {
+              await api('POST', '/api/rooms/close', { room: roomId });
+              win.close();
+            } catch (err) { alertBox('Close Room', err.message); }
+          },
+        }) : null));
+  });
+}
+
+// ---- Room window --------------------------------------------------------------
+
+function openRoom(id) {
+  const room = S.rooms.get(id);
+  if (!room) return;
+  let w = S.roomWins.get(id);
+  if (!w) w = createRoomWin(room);
+  w.win.focus();
+  if (!isTouch()) w.input.focus();
+}
+
+function createRoomWin(initial) {
+  const id = initial.id;
+  let room = initial;
+  let w;
+  const win = makeWindow({
+    title: `${room.name} - Chat Room`, taskLabel: room.name, cls: 'room', back: 'minimize',
+    onClose: () => {
+      S?.roomWins.delete(id);
+      S?.roomLogs.delete(id); // closing the window erases what you saw
+    },
+    onFocus: () => {
+      if (w && room && (room.unread || room.mention)) {
+        room.unread = 0;
+        room.mention = false;
+        w.updateTask();
+        renderBuddyList();
+      }
+    },
+  });
+  const badge = h('span', { class: 'lock' });
+  const topicEl = h('div', { class: 'topic' });
+  const transcript = h('div', { class: `transcript sunken${prefs.get('timestamps', true) ? '' : ' hide-ts'}`, role: 'log', 'aria-live': 'polite' });
+  const people = h('div', { class: 'people sunken', 'aria-label': 'People in this room' });
+  const peopleBtn = h('button', { type: 'button', class: 'people-btn', text: 'People' });
+  const input = h('textarea', { maxlength: String(MAX_ROOM_TEXT), 'aria-label': 'Message', placeholder: 'Say something…', enterkeyhint: 'send', rows: '2' });
+  const send = h('button', { type: 'button', text: 'Send' });
+  const body = h('div', { class: 'room-main' }, transcript, people);
+
+  peopleBtn.addEventListener('click', () => win.el.classList.toggle('show-people'));
+  win.body.append(
+    h('div', { class: 'im-bar' }, badge, h('span', { class: 'grow' }), peopleBtn,
+      h('button', { type: 'button', text: 'Options', onclick: () => roomOptionsDialog(id) })),
+    topicEl, body,
+    h('div', { class: 'compose' }, input, send));
+
+  let stick = true;
+  const scrollDown = () => { transcript.scrollTop = transcript.scrollHeight; };
+  transcript.addEventListener('scroll', () => {
+    stick = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 40;
+  });
+  new ResizeObserver(() => { if (stick) scrollDown(); }).observe(transcript);
+
+  const lineEl = (l) => {
+    if (l.sys) return h('div', { class: `line sys ${l.cls ?? ''}`, text: l.sys });
+    return h('div', { class: `line${l.mention ? ' mention' : ''}` },
+      h('span', { class: `who ${l.side}`, text: l.from }),
+      h('span', { class: 'ts', text: ` (${timeFmt(l.ts)})` }),
+      ': ',
+      h('span', { class: 'text', text: l.text }));
+  };
+
+  const doSend = async () => {
+    const text = input.value.replace(/\s+$/, '');
+    if (!text.trim() || text.length > MAX_ROOM_TEXT) return;
+    input.value = '';
+    input.style.height = '';
+    send.disabled = true;
+    try {
+      if (!(await sendRoomMessage(id, text))) input.value = text;
+    } catch (err) {
+      input.value = text;
+      roomLog(id, { sys: `Not sent: ${err.message}`, cls: 'warn' });
+    }
+    send.disabled = false;
+    if (!isTouch()) input.focus();
+  };
+  send.addEventListener('click', doSend);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      doSend();
+    }
+  });
+  input.addEventListener('input', () => {
+    if (isSmall()) {
+      input.style.height = 'auto';
+      input.style.height = `${input.scrollHeight + 4}px`;
+    }
+  });
+
+  let loading = null;
+  w = {
+    win, input,
+    append(l) {
+      transcript.append(lineEl(l));
+      if (stick || l.side === 'me') scrollDown();
+    },
+    updateTask() {
+      const n = room?.unread ?? 0;
+      win.setTaskLabel(`${room?.name ?? ''}${room?.mention ? ' (@)' : n ? ` (${n})` : ''}`);
+    },
+    update(next) {
+      if (!next) return;
+      room = next;
+      win.setTitle(`${room.name} - Chat Room`);
+      badge.className = `lock ${room.kind === 'private' ? '' : 'public'}`;
+      badge.textContent = room.kind === 'private' ? '🔒 Private · encrypted' : '# Public room';
+      badge.title = room.kind === 'private' ? 'End-to-end encrypted' : 'Not end-to-end encrypted. Anyone can join.';
+      topicEl.textContent = room.topic ? `Topic: ${room.topic}` : '';
+      topicEl.hidden = !room.topic;
+      w.updateTask();
+    },
+    // Refresh the member list (and the room key for private rooms).
+    reload() {
+      if (loading) return loading;
+      loading = (async () => {
+        try {
+          const d = room.kind === 'private' ? await ensureRoomKey(id, { create: false }) : await api('POST', '/api/rooms/get', { room: id });
+          const r = S.rooms.get(id);
+          if (r) Object.assign(r, { role: d.room.role, topic: d.room.topic });
+          const canModerate = d.room.kind === 'public' ? S.me.isAdmin : d.room.role === 'owner';
+          const members = [...d.members].sort((a, c) => (b2n(c.online) - b2n(a.online)) || a.screenName.localeCompare(c.screenName));
+          const here = members.filter((m) => m.online && m.status === 'member').length;
+          peopleBtn.textContent = `People (${here})`;
+          people.replaceChildren(
+            h('div', { class: 'people-head', text: d.room.kind === 'public' ? `Here now (${here})` : `Members (${d.room.members})` }),
+            ...members.map((m) => {
+              const el = h('button', {
+                type: 'button',
+                class: `person${m.online ? '' : ' offline'}${m.status === 'invited' ? ' invited' : ''}`,
+                title: m.status === 'invited' ? 'Invited' : m.online ? 'Online' : 'Offline',
+              },
+              m.role === 'owner' ? '★ ' : '', m.screenName, m.status === 'invited' ? ' (invited)' : '');
+              el.addEventListener('click', () => roomMemberDialog(id, m, canModerate));
+              return el;
+            }));
+          w.update(S.rooms.get(id));
+        } catch (err) {
+          roomLog(id, { sys: err.message, cls: 'warn' });
+        } finally {
+          loading = null;
+        }
+      })();
+      return loading;
+    },
+  };
+  const b2n = (x) => (x ? 1 : 0);
+
+  S.roomWins.set(id, w);
+  w.update(room);
+  roomLog(id, {
+    sys: room.kind === 'private'
+      ? `You're in "${room.name}". Messages are end-to-end encrypted and never saved. Closing this window erases them.`
+      : `You're in "${room.name}". Public rooms aren't end-to-end encrypted, but nothing is saved. Closing this window erases what you see.`,
+  });
+  for (const l of S.roomLogs.get(id) ?? []) if (!l.sys || !l.sys.startsWith("You're in")) transcript.append(lineEl(l));
+  scrollDown();
+  w.reload();
+  return w;
+}
+
+// ---- Directory ----------------------------------------------------------------
+
+function roomsDialog() {
+  dialog('rooms', { title: 'Chat Rooms', cls: 'dialog wide' }, async (win) => {
+    const publicList = h('div', { class: 'list sunken rooms-list' }, h('div', { class: 'muted small', text: 'Loading…' }));
+    const privName = h('input', { type: 'text', maxlength: '32', placeholder: 'e.g. Weekend Plans' });
+    const privMsg = h('p', { class: 'small', role: 'status' });
+    const privForm = h('form', { class: 'field' },
+      h('label', { class: 'field' }, 'Room name', privName),
+      privMsg,
+      h('div', { class: 'row end' }, h('button', { type: 'submit', text: 'Create & Invite' })));
+    privForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!privName.value.trim()) return;
+      try {
+        const r = await api('POST', '/api/rooms/create', { name: privName.value, kind: 'private' });
+        await loadRooms();
+        await ensureRoomKey(r.id);
+        win.close();
+        openRoom(r.id);
+        inviteToRoomDialog(r.id);
+      } catch (err) {
+        privMsg.className = 'small error';
+        privMsg.textContent = err.message;
+      }
+    });
+
+    const render = async () => {
+      let data;
+      try {
+        data = await loadRooms();
+      } catch (err) {
+        publicList.replaceChildren(h('div', { class: 'error small', text: err.message }));
+        return;
+      }
+      publicList.replaceChildren(...(data.public.length ? data.public.map((r) => h('div', { class: 'room-row' },
+        h('div', { class: 'grow' },
+          h('div', { class: 'room-name', text: `# ${r.name}` }),
+          r.topic ? h('div', { class: 'small muted', text: r.topic }) : null),
+        h('span', { class: 'small muted', text: `${r.online} here` }),
+        h('button', {
+          type: 'button', text: r.joined ? 'Open' : 'Join',
+          onclick: async () => {
+            try {
+              if (r.joined) openRoom(r.id);
+              else await joinPublicRoom(r.id);
+              win.close();
+            } catch (err) { alertBox('Join Room', err.message); }
+          },
+        }))) : [h('div', { class: 'muted small', text: 'No public rooms yet.' })]));
+    };
+
+    let adminForm = null;
+    if (S.me.isAdmin) {
+      const pubName = h('input', { type: 'text', maxlength: '32', placeholder: 'e.g. Lobby' });
+      const pubTopic = h('input', { type: 'text', maxlength: '120', placeholder: 'Topic (optional)' });
+      const pubMsg = h('p', { class: 'small', role: 'status' });
+      adminForm = h('form', { class: 'field' },
+        h('label', { class: 'field' }, 'Room name', pubName),
+        h('label', { class: 'field' }, 'Topic', pubTopic),
+        pubMsg,
+        h('div', { class: 'row end' }, h('button', { type: 'submit', text: 'Create Public Room' })));
+      adminForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        try {
+          await api('POST', '/api/rooms/create', { name: pubName.value, topic: pubTopic.value, kind: 'public' });
+          pubName.value = pubTopic.value = '';
+          pubMsg.className = 'small ok';
+          pubMsg.textContent = 'Created.';
+          render();
+        } catch (err) {
+          pubMsg.className = 'small error';
+          pubMsg.textContent = err.message;
+        }
+      });
+    }
+
+    win.body.append(
+      h('fieldset', {}, h('legend', { text: '# Public rooms' }),
+        h('p', { class: 'hint', text: 'Open to everyone here. Not end-to-end encrypted, and nothing is saved.' }),
+        publicList),
+      h('fieldset', {}, h('legend', { text: '🔒 Start a private room' }),
+        h('p', { class: 'hint', text: 'Invite-only and end-to-end encrypted. Invite buddies after creating it.' }),
+        privForm),
+      adminForm ? h('fieldset', {}, h('legend', { text: 'Admin: new public room' }), adminForm) : null,
+      h('div', { class: 'row end' }, h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
+    render();
+  });
 }
 
 // ===========================================================================

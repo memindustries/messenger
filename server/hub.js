@@ -3,8 +3,9 @@ import { WebSocketServer } from 'ws';
 const MSG_ID_RE = /^[A-Za-z0-9_-]{8,40}$/;
 const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const MAX_CT = 24 * 1024;
+const MAX_ROOM_TEXT = 2000;
 
-function validEnvelope(env) {
+export function validEnvelope(env) {
   return env && typeof env === 'object' && env.v === 1
     && typeof env.salt === 'string' && env.salt.length === 24 && B64_RE.test(env.salt)
     && typeof env.iv === 'string' && env.iv.length === 16 && B64_RE.test(env.iv)
@@ -82,6 +83,26 @@ export class Hub {
     for (const id of this.store.buddyIds(user.id)) this.send(id, msg);
   }
 
+  // Send to every signed-on member of a room.
+  sendRoom(roomId, msg, exceptUserId) {
+    const data = JSON.stringify(msg);
+    for (const id of this.store.roomMemberIds(roomId)) {
+      if (id === exceptUserId) continue;
+      for (const ws of this.conns.get(id) ?? []) ws.send(data);
+    }
+  }
+
+  roomOnlineCount(roomId) {
+    return this.store.roomMemberIds(roomId).filter((id) => this.isOnline(id)).length;
+  }
+
+  // "X has entered/left the room" when someone signs on or off.
+  broadcastRoomPresence(user, online) {
+    for (const room of this.store.userRooms(user.id)) {
+      if (room.status === 'member') this.sendRoom(room.id, { t: 'roomPresence', room: room.id, screenName: user.display, online }, user.id);
+    }
+  }
+
   disconnectSession(tokenHash) {
     for (const ws of this.wss?.clients ?? []) if (ws.tokenHash === tokenHash) ws.close(4001, 'Signed off');
   }
@@ -106,6 +127,7 @@ export class Hub {
     if (firstConnection) {
       this.status.set(user.id, { away: false, awayMessage: '' });
       this.broadcastPresence(user);
+      this.broadcastRoomPresence(user, true);
     }
 
     ws.send(JSON.stringify({ t: 'hello', screenName: user.display }));
@@ -137,7 +159,10 @@ export class Hub {
       if (set.size === 0) {
         this.conns.delete(user.id);
         this.status.delete(user.id);
-        if (this.store.userById(user.id)) this.broadcastPresence(user);
+        if (this.store.userById(user.id)) {
+          this.broadcastPresence(user);
+          this.broadcastRoomPresence(user, false);
+        }
       }
     });
   }
@@ -173,6 +198,28 @@ export class Hub {
           return reply({ t: 'sent', id, queued: true });
         }
         return reply({ t: 'error', id, error: `${to.display} is offline and can't receive messages right now.` });
+      }
+      case 'room': {
+        const id = typeof msg.id === 'string' && MSG_ID_RE.test(msg.id) ? msg.id : null;
+        if (!id) return;
+        const room = Number.isInteger(msg.room) ? this.store.room(msg.room) : null;
+        if (!room || this.store.membership(room.id, me.id)?.status !== 'member') {
+          return reply({ t: 'error', id, room: msg.room, error: "You're not in that room." });
+        }
+        if (room.kind === 'public') {
+          // Public rooms are protected by HTTPS only; relayed live, never stored.
+          const text = typeof msg.text === 'string' ? msg.text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').trim() : '';
+          if (!text || text.length > MAX_ROOM_TEXT) return reply({ t: 'error', id, room: room.id, error: 'Message is empty or too long.' });
+          this.sendRoom(room.id, { t: 'room', room: room.id, from: me.display, id, text, ts: Date.now() }, me.id);
+          return reply({ t: 'sent', id, room: room.id });
+        }
+        if (!validEnvelope(msg.env)) return reply({ t: 'error', id, room: room.id, error: 'Malformed message.' });
+        if (msg.epoch !== room.key_epoch) {
+          return reply({ t: 'error', id, room: room.id, rekey: true, error: 'The room key changed; message not sent. Try again.' });
+        }
+        const env = { v: 1, salt: msg.env.salt, iv: msg.env.iv, ct: msg.env.ct };
+        this.sendRoom(room.id, { t: 'room', room: room.id, from: me.display, id, epoch: room.key_epoch, env }, me.id);
+        return reply({ t: 'sent', id, room: room.id });
       }
       case 'delivered': {
         if (!Array.isArray(msg.oids)) return;

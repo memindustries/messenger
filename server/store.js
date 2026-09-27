@@ -41,7 +41,8 @@ export function createStore(db) {
     userByNorm: q('SELECT * FROM users WHERE norm = ?'),
     userById: q('SELECT * FROM users WHERE id = ?'),
     userCount: q('SELECT COUNT(*) AS n FROM users'),
-    insertUser: q('INSERT INTO users (norm, display, auth_salt, auth_hash, public_key, wrapped_key) VALUES (?, ?, ?, ?, ?, ?)'),
+    insertUser: q('INSERT INTO users (norm, display, auth_salt, auth_hash, public_key, wrapped_key, is_admin) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+    setAdmin: q('UPDATE users SET is_admin = ? WHERE id = ?'),
     updateAuth: q('UPDATE users SET auth_salt = ?, auth_hash = ?, wrapped_key = ? WHERE id = ?'),
     deleteUser: q('DELETE FROM users WHERE id = ?'),
     listUsers: q('SELECT id, display FROM users ORDER BY norm'),
@@ -51,10 +52,12 @@ export function createStore(db) {
     deleteSession: q('DELETE FROM sessions WHERE token_hash = ?'),
     deleteOtherSessions: q('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?'),
 
-    insertInvite: q('INSERT INTO invites (code_hash, created_by, expires_at) VALUES (?, ?, ?)'),
-    invite: q('SELECT * FROM invites WHERE code_hash = ? AND expires_at > ?'),
+    insertInvite: q('INSERT INTO invites (code_hash, created_by, expires_at, max_uses, label) VALUES (?, ?, ?, ?, ?)'),
+    invite: q('SELECT * FROM invites WHERE code_hash = ? AND expires_at > ? AND uses < max_uses'),
+    useInvite: q('UPDATE invites SET uses = uses + 1 WHERE code_hash = ?'),
     deleteInvite: q('DELETE FROM invites WHERE code_hash = ?'),
-    countInvites: q('SELECT COUNT(*) AS n FROM invites WHERE created_by = ? AND expires_at > ?'),
+    countInvites: q('SELECT COUNT(*) AS n FROM invites WHERE created_by = ? AND expires_at > ? AND uses < max_uses'),
+    campaigns: q('SELECT label, uses, max_uses, expires_at FROM invites WHERE label IS NOT NULL ORDER BY expires_at DESC'),
 
     buddies: q(`SELECT u.id, u.display, u.norm, u.public_key, b.group_name FROM buddies b
                 JOIN users u ON u.id = b.buddy_id WHERE b.owner_id = ? ORDER BY u.norm`),
@@ -82,9 +85,59 @@ export function createStore(db) {
     deleteOffline: q('DELETE FROM offline_messages WHERE id = ? AND to_id = ?'),
 
     purgeSessions: q('DELETE FROM sessions WHERE expires_at <= ?'),
-    purgeInvites: q('DELETE FROM invites WHERE expires_at <= ?'),
+    purgeInvites: q('DELETE FROM invites WHERE expires_at <= ? OR uses >= max_uses'),
     purgeOffline: q('DELETE FROM offline_messages WHERE expires_at <= ?'),
   };
+
+  const r = {
+    insert: q('INSERT INTO rooms (kind, name, norm, topic) VALUES (?, ?, ?, ?)'),
+    get: q('SELECT * FROM rooms WHERE id = ?'),
+    publicByNorm: q("SELECT id FROM rooms WHERE kind = 'public' AND norm = ?"),
+    del: q('DELETE FROM rooms WHERE id = ?'),
+    setTopic: q('UPDATE rooms SET topic = ? WHERE id = ?'),
+    bumpEpoch: q('UPDATE rooms SET key_epoch = key_epoch + 1 WHERE id = ?'),
+    publicList: q(`SELECT r.id, r.name, r.topic,
+                     (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.id AND m.status = 'member') AS members
+                   FROM rooms r WHERE r.kind = 'public' ORDER BY r.norm`),
+    mine: q(`SELECT r.id, r.kind, r.name, r.topic, r.key_epoch, m.status, m.role FROM room_members m
+             JOIN rooms r ON r.id = m.room_id WHERE m.user_id = ? ORDER BY r.norm`),
+    membership: q('SELECT * FROM room_members WHERE room_id = ? AND user_id = ?'),
+    addMember: q('INSERT OR REPLACE INTO room_members (room_id, user_id, status, role) VALUES (?, ?, ?, ?)'),
+    setStatus: q('UPDATE room_members SET status = ? WHERE room_id = ? AND user_id = ?'),
+    setRole: q('UPDATE room_members SET role = ? WHERE room_id = ? AND user_id = ?'),
+    removeMember: q('DELETE FROM room_members WHERE room_id = ? AND user_id = ?'),
+    members: q(`SELECT u.id, u.display, u.norm, u.public_key, m.status, m.role FROM room_members m
+                JOIN users u ON u.id = m.user_id WHERE m.room_id = ? ORDER BY m.rowid`),
+    memberIds: q("SELECT user_id FROM room_members WHERE room_id = ? AND status = 'member'"),
+    keyHolders: q('SELECT user_id FROM room_members WHERE room_id = ?'),
+    nextOwner: q("SELECT user_id FROM room_members WHERE room_id = ? AND status = 'member' ORDER BY rowid LIMIT 1"),
+    ownedPrivate: q(`SELECT COUNT(*) AS n FROM room_members m JOIN rooms r ON r.id = m.room_id
+                     WHERE m.user_id = ? AND m.role = 'owner' AND r.kind = 'private'`),
+    ban: q('INSERT OR IGNORE INTO room_bans (room_id, user_id) VALUES (?, ?)'),
+    isBanned: q('SELECT 1 FROM room_bans WHERE room_id = ? AND user_id = ?'),
+    insertKey: q('INSERT INTO room_keys (room_id, user_id, epoch, wrapped_by, envelope) VALUES (?, ?, ?, ?, ?)'),
+    keyCount: q('SELECT COUNT(*) AS n FROM room_keys WHERE room_id = ? AND epoch = ?'),
+    myKey: q(`SELECT k.envelope, u.display AS from_display, u.public_key AS from_public_key FROM room_keys k
+              JOIN users u ON u.id = k.wrapped_by WHERE k.room_id = ? AND k.user_id = ? AND k.epoch = ?`),
+    clearKeys: q('DELETE FROM room_keys WHERE room_id = ?'),
+  };
+
+  // Someone left a private room: hand over ownership if needed, delete the room
+  // if it's empty, and retire the room key so a new one must be generated.
+  function afterPrivateDeparture(roomId, wasOwner) {
+    if (r.keyHolders.all(roomId).length === 0 || !r.nextOwner.get(roomId)) {
+      r.del.run(roomId);
+      return { deleted: true };
+    }
+    let newOwnerId = null;
+    if (wasOwner) {
+      newOwnerId = r.nextOwner.get(roomId).user_id;
+      r.setRole.run('owner', roomId, newOwnerId);
+    }
+    r.bumpEpoch.run(roomId);
+    r.clearKeys.run(roomId);
+    return { deleted: false, newOwnerId, epoch: r.get.get(roomId).key_epoch };
+  }
 
   const tx = (fn) => (...args) => {
     db.exec('BEGIN IMMEDIATE');
@@ -108,8 +161,10 @@ export function createStore(db) {
       if (!s.invite.get(inviteHash, Date.now())) return { error: 'invite' };
       const norm = normalizeScreenName(display);
       if (s.userByNorm.get(norm)) return { error: 'taken' };
-      s.deleteInvite.run(inviteHash);
-      const r = s.insertUser.run(norm, display, salt, hash, publicKey, wrappedKey);
+      s.useInvite.run(inviteHash);
+      // The very first account runs the place.
+      const isAdmin = s.userCount.get().n === 0 ? 1 : 0;
+      const r = s.insertUser.run(norm, display, salt, hash, publicKey, wrappedKey, isAdmin);
       return { id: Number(r.lastInsertRowid) };
     }),
     updateAuth: (id, salt, hash, wrappedKey) => s.updateAuth.run(salt, hash, wrappedKey, id),
@@ -126,9 +181,19 @@ export function createStore(db) {
 
     createInvite(createdBy, ttlMs) {
       const code = newInviteCode();
-      s.insertInvite.run(sha256(normalizeInvite(code)), createdBy, Date.now() + ttlMs);
+      s.insertInvite.run(sha256(normalizeInvite(code)), createdBy, Date.now() + ttlMs, 1, null);
       return { code, expiresAt: Date.now() + ttlMs };
     },
+    // Reusable code with a use cap, e.g. posted in an Instagram story.
+    createCampaign(code, maxUses, ttlMs) {
+      const hash = sha256(normalizeInvite(code));
+      s.deleteInvite.run(hash);
+      s.insertInvite.run(hash, null, Date.now() + ttlMs, maxUses, code);
+      return { code, maxUses, expiresAt: Date.now() + ttlMs };
+    },
+    campaigns: () => s.campaigns.all(),
+    revokeInvite: (code) => s.deleteInvite.run(sha256(normalizeInvite(code))).changes > 0,
+    setAdmin: (id, on) => s.setAdmin.run(on ? 1 : 0, id),
     countInvites: (userId) => s.countInvites.get(userId, Date.now()).n,
     countAllInvites: () => db.prepare('SELECT COUNT(*) AS n FROM invites WHERE expires_at > ?').get(Date.now()).n,
 
@@ -179,6 +244,64 @@ export function createStore(db) {
     },
     offlineFor: (userId) => s.offlineFor.all(userId, Date.now()),
     deleteOffline: (id, toId) => s.deleteOffline.run(id, toId),
+
+    // ---- Rooms ----------------------------------------------------------------
+    room: (id) => r.get.get(id),
+    publicRooms: () => r.publicList.all(),
+    userRooms: (userId) => r.mine.all(userId),
+    membership: (roomId, userId) => r.membership.get(roomId, userId),
+    roomMembers: (roomId) => r.members.all(roomId),
+    roomMemberIds: (roomId) => r.memberIds.all(roomId).map((x) => x.user_id),
+    ownedPrivateCount: (userId) => r.ownedPrivate.get(userId).n,
+    isRoomBanned: (roomId, userId) => !!r.isBanned.get(roomId, userId),
+    setTopic: (roomId, topic) => r.setTopic.run(topic, roomId),
+    closeRoom: (roomId) => r.del.run(roomId),
+
+    createRoom: tx(({ kind, name, topic, ownerId }) => {
+      const norm = normalizeScreenName(name);
+      if (kind === 'public' && r.publicByNorm.get(norm)) return { error: 'taken' };
+      const id = Number(r.insert.run(kind, name, norm, topic).lastInsertRowid);
+      r.addMember.run(id, ownerId, 'member', 'owner');
+      return { id };
+    }),
+
+    joinPublic: (roomId, userId) => r.addMember.run(roomId, userId, 'member', 'member'),
+
+    inviteToRoom: tx((roomId, inviterId, inviteeId, epoch, envelope) => {
+      const room = r.get.get(roomId);
+      if (room.key_epoch !== epoch || r.keyCount.get(roomId, epoch).n === 0) return { error: 'rekey' };
+      r.addMember.run(roomId, inviteeId, 'invited', 'member');
+      r.insertKey.run(roomId, inviteeId, epoch, inviterId, envelope);
+      return {};
+    }),
+
+    acceptRoomInvite: (roomId, userId) => r.setStatus.run('member', roomId, userId),
+
+    // Leave, decline, kick. Returns what changed so callers can notify people.
+    leaveRoom: tx((roomId, userId, { ban = false } = {}) => {
+      const room = r.get.get(roomId);
+      const m = r.membership.get(roomId, userId);
+      if (!room || !m) return null;
+      r.removeMember.run(roomId, userId);
+      if (ban) r.ban.run(roomId, userId);
+      if (room.kind === 'public') return { deleted: false };
+      return afterPrivateDeparture(roomId, m.role === 'owner');
+    }),
+
+    // Store a freshly generated room key, wrapped for every current member and invitee.
+    submitRekey: tx((roomId, wrapperId, epoch, entries) => {
+      const room = r.get.get(roomId);
+      if (!room || room.key_epoch !== epoch) return { error: 'stale' };
+      if (r.keyCount.get(roomId, epoch).n > 0) return { error: 'exists' };
+      const holders = new Set(r.keyHolders.all(roomId).map((x) => x.user_id));
+      const given = new Set(entries.map((e) => e.userId));
+      if (holders.size !== given.size || [...holders].some((id) => !given.has(id))) return { error: 'members' };
+      for (const e of entries) r.insertKey.run(roomId, e.userId, epoch, wrapperId, e.envelope);
+      return {};
+    }),
+
+    myRoomKey: (roomId, userId, epoch) => r.myKey.get(roomId, userId, epoch),
+    roomHasKey: (roomId, epoch) => r.keyCount.get(roomId, epoch).n > 0,
 
     purgeExpired() {
       const now = Date.now();

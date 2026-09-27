@@ -67,3 +67,23 @@ test('safety numbers match on both sides and differ per pair', async () => {
   const s3 = await C.safetyNumber('alice', alice.publicKey, 'bob', eve.publicKey);
   assert.notDeepEqual(s1, s3);
 });
+
+test('room keys wrap per member and room messages are bound to room, epoch and sender', async () => {
+  const alice = await account('alice', 'pw alice 123');
+  const bob = await account('bob', 'pw bob 12345');
+  const raw = C.newRoomKey();
+  const toBob = await C.deriveConversationKey(alice.privateKey, bob.publicKey);
+  const wrapped = await C.wrapRoomKey(toBob, { roomId: 7, epoch: 2, from: 'alice', to: 'bob' }, raw);
+  const fromAlice = await C.deriveConversationKey(bob.privateKey, alice.publicKey);
+  const got = await C.unwrapRoomKey(fromAlice, { roomId: 7, epoch: 2, from: 'alice', to: 'bob' }, wrapped);
+  assert.deepEqual(got, raw);
+  await assert.rejects(C.unwrapRoomKey(fromAlice, { roomId: 8, epoch: 2, from: 'alice', to: 'bob' }, wrapped));
+
+  const k = await C.importRoomKey(raw);
+  const meta = { roomId: 7, epoch: 2, from: 'alice', id: 'room-msg-123' };
+  const env = await C.encryptRoomMessage(k, meta, { text: 'hi room', ts: 1 });
+  assert.deepEqual(await C.decryptRoomMessage(k, meta, env), { text: 'hi room', ts: 1 });
+  await assert.rejects(C.decryptRoomMessage(k, { ...meta, from: 'bob' }, env));
+  await assert.rejects(C.decryptRoomMessage(k, { ...meta, epoch: 3 }, env));
+  await assert.rejects(C.decryptRoomMessage(await C.importRoomKey(C.newRoomKey()), meta, env));
+});

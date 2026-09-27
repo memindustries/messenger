@@ -3,9 +3,10 @@
 A late-90s instant messenger for you and your friends. It has a buddy list, away messages, door-creak sign-on sounds and "is typing…". Messages are **end-to-end encrypted**, and signing up needs **no email and no real name**.
 
 - **Screen name + password only.** No email, phone number or real name, ever.
-- **Invite-only.** New people need a single-use invite code from an existing member.
-- **End-to-end encrypted.** Messages are encrypted in the browser. The server only relays ciphertext it can't read.
-- **No chat history.** Conversations live only in the open IM window. Closing it erases them.
+- **Invite-only.** New people need an invite code: a personal one from a member, or a campaign code you post (e.g. in an Instagram story).
+- **End-to-end encrypted.** IMs and private chat rooms are encrypted in the browser. The server only relays ciphertext it can't read.
+- **Chat rooms.** Public rooms anyone can join, and invite-only private rooms that are end-to-end encrypted.
+- **No chat history.** Conversations live only in the open window. Closing it erases them.
 - **Minimal data.** No analytics, trackers, third-party scripts, fonts or CDNs. The server keeps no logs of IPs or messages.
 
 ## On your phone
@@ -18,6 +19,42 @@ On phones, every window fills the screen:
 - Use **‹** or your phone's Back gesture to return to the Buddy List. Back never signs you off.
 - New messages show a small banner and a red unread count instead of covering what you're doing.
 
+## Chat rooms
+
+Tap **Chat** in the Buddy List to see the room list.
+
+| | Public rooms | Private rooms |
+|---|---|---|
+| Who creates them | Admins | Anyone |
+| Who can join | Anyone, from the room list | Buddies the members invite |
+| Encryption | HTTPS in transit only; the server relays the text | End-to-end; the server only sees ciphertext |
+| Moderation | Admins can set the topic, remove people, close the room | The owner can do the same |
+| Size | No fixed limit | Up to 50 people |
+
+- Rooms you're in appear under **Chat Rooms** on your Buddy List, with an unread count. You're "in" them whenever you're signed on.
+- Nothing is saved. You see what's said while you're signed on, and closing the room window erases it. Leaving a room is a separate button under **Options**.
+- Mentioning someone's screen name (`@Bob Dog` or just `Bob Dog`) highlights the message for them, plays a sound, and shows a banner on phones.
+- Tap a name in a room's member list to IM them, add them as a buddy, or (moderators) remove them. Removed people can't rejoin that room.
+- Messages from people you've blocked are hidden in rooms.
+
+## Letting your followers sign up (campaign codes)
+
+A campaign code is one invite code that many people can use, with a limit on sign-ups and an expiry. Post it where your audience is, such as an Instagram story (which disappears in 24 hours anyway):
+
+```sh
+npm run admin -- campaign MEM-DROP --uses 300 --hours 48   # custom code
+npm run admin -- campaign --uses 100 --hours 24            # random, harder-to-guess code
+npm run admin -- campaigns                                 # see how many signed up with each
+npm run admin -- revoke MEM-DROP                           # kill it instantly if it leaks
+```
+
+- Run these on Railway with `railway ssh` (in the service's directory).
+- You can run several codes at once, for example one for Close Friends and one for a public story, and compare sign-ups.
+- Personal single-use invites from the **Invite** button keep working alongside campaign codes.
+- Sign-ups are limited to 30 per IP address per hour (`REGISTRATIONS_PER_HOUR`). The limit is set this high because many phones on the same carrier can share one IP.
+
+**Admins.** The first screen name ever created is the admin. Admins create and moderate public rooms from the **Chat** window. Add or remove admins with `npm run admin -- make-admin "Screen Name"` / `remove-admin`.
+
 ## Deploy on Railway
 
 1. In Railway choose **New Project → Deploy from GitHub repo** and pick this repo.
@@ -29,8 +66,8 @@ On phones, every window fills the screen:
    No accounts yet. Use this one-time invite code to create the first screen name:
        K7QM-2XPA-9RTF-HB3C
    ```
-5. Visit your domain, click **Get a Screen Name**, and use that code.
-   After that, generate invites for friends from the **Invite** button in the Buddy List.
+5. Visit your domain, click **Get a Screen Name**, and use that code. That account becomes the admin.
+   After that, generate invites for friends from the **Invite** button, or make a campaign code (see above).
 
 No environment variables are required. The app detects Railway and then:
 
@@ -49,7 +86,7 @@ Railway handles HTTPS. `railway.json` sets the start command and a `/healthz` he
 | `SESSION_TTL_HOURS` | `24` | Sign-on session lifetime. |
 | `INVITES_PER_USER` | `5` | Max unused invite codes per person. |
 | `INVITE_TTL_DAYS` | `7` | Invite code lifetime. |
-| `REGISTRATIONS_PER_HOUR` | `10` | Sign-ups allowed per IP per hour. |
+| `REGISTRATIONS_PER_HOUR` | `30` | Sign-ups allowed per IP per hour. |
 | `ALLOWED_ORIGINS` | *(same host)* | Comma-separated origins allowed to call the API, if you serve from several domains. |
 
 ### Admin commands
@@ -57,8 +94,12 @@ Railway handles HTTPS. `railway.json` sets the start command and a `/healthz` he
 From a shell on the server (`railway ssh`), or locally against your own data directory:
 
 ```sh
-npm run invite                              # print a fresh invite code
-npm run admin -- users                      # list screen names
+npm run invite                              # print a fresh single-use invite code
+npm run admin -- campaign CODE --uses N --hours H   # reusable campaign code
+npm run admin -- campaigns                  # list campaign codes and sign-up counts
+npm run admin -- revoke CODE                # stop a code working
+npm run admin -- users                      # list screen names (* = admin)
+npm run admin -- make-admin "Screen Name"   # or remove-admin
 npm run admin -- delete-user "Screen Name"  # delete a user and all their data
 ```
 
@@ -102,10 +143,20 @@ npm test
 - Presence and away messages are held in memory only. The database uses `secure_delete`.
 - Only one runtime dependency (`ws`); the database is Node's built-in SQLite.
 
+**Private chat rooms**
+- Each private room has a random 256-bit room key.
+- Whoever creates the key encrypts a separate copy to each member, using the same pairwise scheme as IMs. The server stores only those encrypted copies.
+- Room messages use AES-256-GCM with a fresh key per message. The room, key version, sender and message ID are authenticated along with the text.
+- When anyone leaves or is removed, the old key is retired. A new key is generated for the remaining members, so people who left can't read what's said afterwards, even with the server's help.
+- If a member is also your buddy, their key is checked against the one pinned on your device before a room key is shared with them.
+
+**Public chat rooms** are protected by HTTPS but are *not* end-to-end encrypted: the server relays the text. It is never written to disk or logged.
+
 ### Honest limitations
 
 - **No password reset.** There's no email to reset with, and the password protects your encryption key. A forgotten password means a new account.
 - **No forward secrecy.** The design uses long-term keys, not a Signal-style ratchet. Someone who later steals both your password *and* the server database could decrypt messages they had previously captured in transit or in the offline queue.
-- **Visible to the server:** who is buddies with whom, when people are online, the timing and size of messages, and away messages, which are not end-to-end encrypted.
+- **Visible to the server:** who is buddies with whom, who is in which room, when people are online, the timing and size of messages, away messages, and public-room messages.
+- **Private rooms with non-buddies:** you can't compare safety numbers with room members who aren't your buddies. For them, you trust the server to hand out their real keys. Add people as buddies and verify them if that matters.
 - **You trust the server for the code.** Like any web app, a compromised server could serve malicious JavaScript. Keep your Railway and GitHub accounts protected with 2FA.
 - It's built for a small group of friends, not thousands of users.

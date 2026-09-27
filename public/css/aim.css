@@ -138,7 +138,7 @@ legend { padding: 0 3px; }
 .status-line { min-height: 16px; text-align: center; }
 
 /* ---- Buddy list ------------------------------------------------------- */
-.buddylist { width: 230px; height: 520px; }
+.buddylist { width: 250px; height: 540px; }
 .bl-head { background: #fff; padding: 6px; display: flex; gap: 8px; align-items: center; }
 .bl-head img { width: 36px; height: 36px; }
 .bl-head .me { font-weight: bold; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
@@ -162,8 +162,8 @@ legend { padding: 0 3px; }
   margin-left: auto; min-width: 18px; padding: 0 5px; border-radius: 9px;
   background: #d00000; color: #fff; font: bold 11px/16px Tahoma, sans-serif; text-align: center;
 }
-.bl-buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
-.bl-buttons button { padding: 3px 2px; }
+.bl-buttons { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+.bl-buttons button { padding: 3px 0; white-space: nowrap; }
 .conn { font-size: 11px; text-align: center; }
 
 /* ---- IM window -------------------------------------------------------- */
@@ -186,6 +186,30 @@ legend { padding: 0 3px; }
 .compose { display: flex; gap: 6px; align-items: stretch; }
 .compose textarea { height: 56px; font-size: 13px; }
 .compose button { min-width: 64px; }
+
+/* ---- Chat rooms ------------------------------------------------------ */
+.room { width: 560px; height: 430px; min-height: 280px; }
+.room .topic { padding: 2px 4px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.room-main { flex: 1; display: flex; gap: 6px; min-height: 0; position: relative; }
+.room-main .transcript { flex: 1; }
+.people { width: 150px; overflow-y: auto; padding: 2px 0; display: flex; flex-direction: column; }
+.people-head { font-weight: bold; padding: 2px 6px 4px; }
+.person {
+  display: block; width: 100%; text-align: left; border: none; box-shadow: none; background: none;
+  padding: 2px 6px; min-height: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.person:hover, .person:focus-visible { background: var(--sel); color: #fff; outline: none; }
+.person:active:not(:disabled) { border: none; box-shadow: none; }
+.person.offline, .person.invited { color: var(--shadow); }
+.person.invited { font-style: italic; }
+.people-btn { display: none; }
+.lock.public { background: #eef3ff; border-color: #88a; }
+.line.mention { background: #ffff9c; }
+.bl-item.mention .name { font-weight: bold; }
+.rooms-list { max-height: 220px; }
+.room-row { display: flex; gap: 8px; align-items: center; padding: 4px 6px; border-bottom: 1px solid #e4e4e4; }
+.room-row:last-child { border-bottom: none; }
+.room-name { font-weight: bold; }
 
 /* ---- Dialogs ---------------------------------------------------------- */
 .dialog { width: 320px; }
@@ -278,6 +302,18 @@ legend { padding: 0 3px; }
   .statusbar { font-size: 12px; }
   .compose textarea { height: auto; min-height: 44px; max-height: 120px; font-size: 16px; }
   .compose button { min-width: 72px; }
+
+  .room .window-body { overflow: hidden; }
+  .people-btn { display: inline-block; }
+  .people {
+    display: none; position: absolute; inset: 0 0 0 auto; width: min(260px, 75%); z-index: 2;
+    box-shadow: -3px 0 0 rgba(0,0,0,.25), inset 1px 1px var(--dark);
+  }
+  .room.show-people .people { display: flex; }
+  .person { min-height: 44px; font-size: 16px; padding: 0 12px; }
+  .people-head { padding: 8px 12px; font-size: 14px; }
+  .room-row { padding: 8px; }
+  .rooms-list { max-height: none; }
 
   .safety { font-size: 16px; gap: 6px 10px; }
   .list { max-height: none; }

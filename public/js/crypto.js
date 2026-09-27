@@ -168,3 +168,56 @@ export async function safetyNumber(nameA, keyA, nameB, keyB) {
   }
   return groups;
 }
+
+// ---------------------------------------------------------------------------
+// Private chat rooms
+//
+// Each private room has a random 256-bit room key per "epoch". Whoever creates
+// (or re-creates) the key encrypts a copy to every member with the same
+// pairwise ECDH scheme used for IMs. When anyone leaves or is removed, the
+// epoch advances and a remaining member generates a brand-new key, so former
+// members can't read anything said afterwards.
+
+function roomKeyMeta(roomId, epoch, from, to) {
+  return { from, to, id: `roomkey-${roomId}-${epoch}` };
+}
+
+export function newRoomKey() {
+  return randomBytes(32);
+}
+
+export async function importRoomKey(raw) {
+  return subtle.importKey('raw', raw, 'HKDF', false, ['deriveKey']);
+}
+
+// Encrypt a raw room key for one member. `pairKey` = deriveConversationKey(myPriv, theirPub).
+export async function wrapRoomKey(pairKey, { roomId, epoch, from, to }, raw) {
+  return encryptMessage(pairKey, roomKeyMeta(roomId, epoch, from, to), { k: b64(raw), roomId, epoch });
+}
+
+export async function unwrapRoomKey(pairKey, { roomId, epoch, from, to }, envelope) {
+  const p = await decryptMessage(pairKey, roomKeyMeta(roomId, epoch, from, to), envelope);
+  if (p.roomId !== roomId || p.epoch !== epoch) throw new Error('Room key does not match this room.');
+  const raw = unb64(p.k);
+  if (raw.length !== 32) throw new Error('Bad room key.');
+  return raw;
+}
+
+function roomAad({ roomId, epoch, from, id }) {
+  return enc.encode(`${PREFIX}/room|${roomId}|${epoch}|${normalizeScreenName(from)}|${id}`);
+}
+
+export async function encryptRoomMessage(roomKey, meta, payload) {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
+  const key = await messageKey(roomKey, salt, 'encrypt');
+  const ct = await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: roomAad(meta) }, key, enc.encode(JSON.stringify(payload)));
+  return { v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) };
+}
+
+export async function decryptRoomMessage(roomKey, meta, envelope) {
+  const key = await messageKey(roomKey, unb64(envelope.salt), 'decrypt');
+  const pt = await subtle.decrypt(
+    { name: 'AES-GCM', iv: unb64(envelope.iv), additionalData: roomAad(meta) }, key, unb64(envelope.ct));
+  return JSON.parse(dec.decode(pt));
+}
