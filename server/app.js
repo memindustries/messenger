@@ -3,7 +3,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { Hub, validEnvelope } from './hub.js';
 import {
-  createStore, hashAuthKey, verifyAuthKey, normalizeScreenName, normalizeInvite, sha256,
+  createStore, hashAuthKey, verifyAuthKey, normalizeScreenName, normalizeInvite, newInviteCode, sha256,
 } from './store.js';
 
 const SCREEN_NAME_RE = /^[A-Za-z][A-Za-z0-9]*( [A-Za-z0-9]+)*$/;
@@ -248,6 +248,29 @@ export function createApp({ config, db }) {
     return other;
   }
 
+  // ---- Admin helpers -------------------------------------------------------
+
+  // Owners are the configured ADMIN_SCREEN_NAMES (e.g. "mem"): they can make
+  // and remove admins. Admins can make campaign codes and run public rooms.
+  const isOwner = (user) => config.adminNames.includes(user.norm);
+  const roles = (user) => ({ isAdmin: !!user.is_admin, isOwner: isOwner(user) });
+
+  function requireAdmin(session) {
+    if (!session.user.is_admin) throw new HttpError(403, 'Only admins can do that.');
+  }
+
+  function requireOwner(session) {
+    if (!isOwner(session.user)) throw new HttpError(403, 'Only the site owner can do that.');
+  }
+
+  function campaignView(c) {
+    const now = Date.now();
+    return {
+      code: c.label, uses: c.uses, maxUses: c.max_uses, expiresAt: c.expires_at,
+      status: c.expires_at <= now ? 'expired' : c.uses >= c.max_uses ? 'full' : 'active',
+    };
+  }
+
   // ---- Room helpers --------------------------------------------------------
 
   function requireRoom(roomId, userId, { member = true } = {}) {
@@ -312,7 +335,7 @@ export function createApp({ config, db }) {
       if (result.error === 'taken') throw new HttpError(409, 'That screen name is taken.');
       const token = store.createSession(result.id, config.sessionTtlMs);
       setSessionCookie(res, token, config.sessionTtlMs);
-      sendJson(res, 201, { screenName, isAdmin: !!store.userById(result.id).is_admin });
+      sendJson(res, 201, { screenName, ...roles(store.userById(result.id)) });
     },
 
     'POST /api/login': async (req, res, body) => {
@@ -332,7 +355,7 @@ export function createApp({ config, db }) {
       const token = store.createSession(user.id, config.sessionTtlMs);
       setSessionCookie(res, token, config.sessionTtlMs);
       sendJson(res, 200, {
-        screenName: user.display, publicKey: user.public_key, wrappedKey: user.wrapped_key, isAdmin: !!user.is_admin,
+        screenName: user.display, publicKey: user.public_key, wrappedKey: user.wrapped_key, ...roles(user),
       });
     },
 
@@ -351,7 +374,7 @@ export function createApp({ config, db }) {
       sendJson(res, 200, {
         screenName: session.user.display,
         publicKey: session.user.public_key,
-        isAdmin: !!session.user.is_admin,
+        ...roles(session.user),
       });
     },
 
@@ -599,6 +622,59 @@ export function createApp({ config, db }) {
       store.closeRoom(room.id);
       for (const id of people) hub.send(id, { t: 'roomClosed', room: room.id, name: room.name });
       sendJson(res, 200, { ok: true });
+    },
+  });
+
+  Object.assign(routes, {
+    'GET /api/admin/campaigns': async (req, res, body, session) => {
+      requireAdmin(session);
+      sendJson(res, 200, { campaigns: store.campaigns().map(campaignView) });
+    },
+
+    'POST /api/admin/campaigns': async (req, res, body, session) => {
+      requireAdmin(session);
+      limiter.hit(`campaign:${session.user.id}`, 30, 3600_000);
+      let code = typeof body.code === 'string' ? body.code.trim().toUpperCase() : '';
+      if (code) {
+        if (!/^[A-Z0-9-]{6,32}$/.test(code) || normalizeInvite(code).length < 6) {
+          throw new HttpError(400, 'Codes are 6-32 letters, numbers or dashes.');
+        }
+        if (store.inviteExists(code)) throw new HttpError(409, 'That code already exists. Pick another, or revoke the old one first.');
+      } else {
+        code = newInviteCode();
+      }
+      const uses = Math.floor(Number(body.uses));
+      const hours = Number(body.hours);
+      if (!(uses >= 1 && uses <= 100_000)) throw new HttpError(400, 'Sign-up limit must be between 1 and 100,000.');
+      if (!(hours >= 1 && hours <= 5 * 8760)) throw new HttpError(400, 'Codes can last from 1 hour to 5 years.');
+      const c = store.createCampaign(code, uses, hours * 3600_000);
+      sendJson(res, 201, { code: c.code, maxUses: c.maxUses, expiresAt: c.expiresAt });
+    },
+
+    'POST /api/admin/campaigns/revoke': async (req, res, body, session) => {
+      requireAdmin(session);
+      const code = typeof body.code === 'string' ? body.code : '';
+      if (!store.campaigns().some((c) => c.label === code)) throw new HttpError(404, 'No such campaign code.');
+      store.revokeInvite(code);
+      sendJson(res, 200, { ok: true });
+    },
+
+    'GET /api/admin/admins': async (req, res, body, session) => {
+      requireOwner(session);
+      sendJson(res, 200, {
+        admins: store.listAdmins().map((u) => ({ screenName: u.display, owner: config.adminNames.includes(u.norm) })),
+      });
+    },
+
+    'POST /api/admin/admins': async (req, res, body, session) => {
+      requireOwner(session);
+      const target = typeof body.screenName === 'string' ? store.userByName(body.screenName) : null;
+      if (!target) throw new HttpError(404, 'No user by that screen name.');
+      const on = body.admin === true;
+      if (!on && isOwner(target)) throw new HttpError(400, `${target.display} is a site owner and always an admin.`);
+      store.setAdmin(target.id, on);
+      hub.send(target.id, { t: 'roles', ...roles({ ...target, is_admin: on ? 1 : 0 }) });
+      sendJson(res, 200, { screenName: target.display, isAdmin: on });
     },
   });
 

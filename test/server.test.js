@@ -450,3 +450,74 @@ test('existing accounts with a configured admin name are promoted at startup', a
   assert.equal(second.store.userByName('bigboss').is_admin, 1);
   second.close();
 });
+
+// ---------------------------------------------------------------------------
+// In-app admin tools
+
+async function registerMem() {
+  const existing = app.store.userByName('mem');
+  if (existing) {
+    const login = await req('POST', '/api/login', { screenName: 'mem', authKey: (await C.deriveAccountKeys('mem', 'long password 1', ITER)).authKey });
+    return { name: 'MEM', cookie: login.cookie };
+  }
+  return register('MEM');
+}
+
+test('admins create, list and revoke campaign codes in the app; others cannot', async () => {
+  const boss = await register('Code Admin');
+  const pleb = await register('Code Pleb');
+  app.store.setAdmin(app.store.userByName('Code Admin').id, true);
+  assert.equal((await req('POST', '/api/admin/campaigns', { uses: 5, hours: 24 }, pleb.cookie)).status, 403);
+  assert.equal((await req('GET', '/api/admin/campaigns', null, pleb.cookie)).status, 403);
+
+  const rnd = await req('POST', '/api/admin/campaigns', { uses: 5, hours: 24 }, boss.cookie);
+  assert.equal(rnd.status, 201);
+  assert.match(rnd.body.code, /^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$/);
+  const custom = await req('POST', '/api/admin/campaigns', { code: 'ig-story-1', uses: 300, hours: 48 }, boss.cookie);
+  assert.equal(custom.body.code, 'IG-STORY-1');
+  assert.equal((await req('POST', '/api/admin/campaigns', { code: 'IG-STORY-1', uses: 1, hours: 1 }, boss.cookie)).status, 409);
+  assert.equal((await req('POST', '/api/admin/campaigns', { code: 'abc', uses: 1, hours: 1 }, boss.cookie)).status, 400);
+  assert.equal((await req('POST', '/api/admin/campaigns', { uses: 0, hours: 1 }, boss.cookie)).status, 400);
+
+  // Someone signs up with it; the count shows.
+  const keys = await C.deriveAccountKeys('Story Fan', 'long password 1', ITER);
+  const id = await C.generateIdentity(keys.wrapKey, keys.norm);
+  assert.equal((await req('POST', '/api/register', { screenName: 'Story Fan', inviteCode: 'IG-STORY-1', authKey: keys.authKey, publicKey: id.publicKey, wrappedKey: id.wrappedKey })).status, 201);
+  const list = (await req('GET', '/api/admin/campaigns', null, boss.cookie)).body.campaigns;
+  const row = list.find((c) => c.code === 'IG-STORY-1');
+  assert.deepEqual([row.uses, row.maxUses, row.status], [1, 300, 'active']);
+
+  assert.equal((await req('POST', '/api/admin/campaigns/revoke', { code: 'IG-STORY-1' }, boss.cookie)).status, 200);
+  assert.ok(!(await req('GET', '/api/admin/campaigns', null, boss.cookie)).body.campaigns.some((c) => c.code === 'IG-STORY-1'));
+
+  // Used-up campaign codes stay listed after the periodic purge.
+  app.store.createCampaign('FULL-CODE', 1, 60_000);
+  app.store.createUser({ inviteHash: (await import('../server/store.js')).sha256('FULLCODE'), display: 'Full User', salt: 's', hash: 'h', publicKey: '{}', wrappedKey: '{}' });
+  app.store.purgeExpired();
+  assert.equal(app.store.campaigns().find((c) => c.label === 'FULL-CODE').uses, 1);
+});
+
+test('only the owner ("mem") can make and remove admins; changes reach the person live', async () => {
+  const mem = await registerMem();
+  const helper = await register('Helper Hal');
+  const regularAdmin = await register('Regular Admin');
+  app.store.setAdmin(app.store.userByName('Regular Admin').id, true);
+
+  const me = (await req('GET', '/api/me', null, mem.cookie)).body;
+  assert.deepEqual([me.isAdmin, me.isOwner], [true, true]);
+  assert.equal((await req('POST', '/api/admin/admins', { screenName: 'Helper Hal', admin: true }, regularAdmin.cookie)).status, 403);
+  assert.equal((await req('GET', '/api/admin/admins', null, regularAdmin.cookie)).status, 403);
+
+  const wh = await connect(helper);
+  assert.equal((await req('POST', '/api/admin/admins', { screenName: 'helperhal', admin: true }, mem.cookie)).status, 200);
+  assert.deepEqual(await wh.next((m) => m.t === 'roles'), { t: 'roles', isAdmin: true, isOwner: false });
+  assert.equal((await req('GET', '/api/me', null, helper.cookie)).body.isAdmin, true);
+  const admins = (await req('GET', '/api/admin/admins', null, mem.cookie)).body.admins;
+  assert.ok(admins.some((a) => a.screenName === 'Helper Hal' && !a.owner));
+  assert.ok(admins.some((a) => a.screenName === 'MEM' && a.owner));
+
+  assert.equal((await req('POST', '/api/admin/admins', { screenName: 'Helper Hal', admin: false }, mem.cookie)).status, 200);
+  assert.equal((await wh.next((m) => m.t === 'roles')).isAdmin, false);
+  assert.equal((await req('POST', '/api/admin/admins', { screenName: 'mem', admin: false }, mem.cookie)).status, 400);
+  wh.close();
+});

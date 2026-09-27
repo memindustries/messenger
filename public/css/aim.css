@@ -41,7 +41,7 @@ body {
   border-color: var(--hilite) var(--dark) var(--dark) var(--hilite);
   box-shadow: inset -1px -1px var(--shadow), inset 1px 1px var(--light);
 }
-.sunken, input[type=text], input[type=password], textarea, select {
+.sunken, input[type=text], input[type=password], input[type=number], textarea, select {
   border: 2px solid;
   border-color: var(--shadow) var(--hilite) var(--hilite) var(--shadow);
   box-shadow: inset 1px 1px var(--dark);
@@ -105,7 +105,7 @@ button:active:not(:disabled) {
 }
 button:focus-visible { outline: 1px dotted #000; outline-offset: -5px; }
 button:disabled { color: var(--shadow); text-shadow: 1px 1px #fff; cursor: default; }
-input[type=text], input[type=password], textarea, select { font: inherit; padding: 3px 4px; width: 100%; color: #000; }
+input[type=text], input[type=password], input[type=number], textarea, select { font: inherit; padding: 3px 4px; width: 100%; color: #000; }
 textarea { resize: none; }
 input:focus, textarea:focus, select:focus { outline: none; }
 label { display: block; }
@@ -220,6 +220,14 @@ legend { padding: 0 3px; }
 .list .row { padding: 2px 4px; }
 .banner-warn { background: #ffe0e0; border: 1px solid #c00; padding: 6px; }
 
+/* ---- Admin tools ----------------------------------------------------- */
+.campaigns { max-height: 200px; }
+.campaign { display: flex; gap: 6px; align-items: center; padding: 4px 6px; border-bottom: 1px solid #e4e4e4; }
+.campaign:last-child { border-bottom: none; }
+.campaign-code { font: bold 13px "Courier New", monospace; }
+.campaign.expired, .campaign.full { color: var(--shadow); }
+form.row input { flex: 1; }
+
 /* ---- Taskbar ---------------------------------------------------------- */
 #taskbar {
   position: absolute; left: 0; right: 0; bottom: 0;
@@ -280,7 +288,7 @@ legend { padding: 0 3px; }
 
   button { min-height: 40px; }
   .linkish { min-height: 32px; }
-  input[type=text], input[type=password], textarea, select { font-size: 16px; padding: 6px; } /* 16px stops iOS zooming */
+  input[type=text], input[type=password], input[type=number], textarea, select { font-size: 16px; padding: 6px; } /* 16px stops iOS zooming */
   .check { min-height: 36px; }
   .check input { width: 20px; height: 20px; }
 

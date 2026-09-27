@@ -46,6 +46,7 @@ export function createStore(db) {
     updateAuth: q('UPDATE users SET auth_salt = ?, auth_hash = ?, wrapped_key = ? WHERE id = ?'),
     deleteUser: q('DELETE FROM users WHERE id = ?'),
     listUsers: q('SELECT id, display FROM users ORDER BY norm'),
+    listAdmins: q('SELECT id, display, norm FROM users WHERE is_admin = 1 ORDER BY norm'),
 
     insertSession: q('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)'),
     session: q('SELECT s.token_hash, s.expires_at, u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?'),
@@ -85,7 +86,10 @@ export function createStore(db) {
     deleteOffline: q('DELETE FROM offline_messages WHERE id = ? AND to_id = ?'),
 
     purgeSessions: q('DELETE FROM sessions WHERE expires_at <= ?'),
-    purgeInvites: q('DELETE FROM invites WHERE expires_at <= ? OR uses >= max_uses'),
+    // Personal invites go as soon as they're used or expire; campaign codes stay
+    // listed (with their sign-up counts) for 30 days after they expire.
+    purgeInvites: q(`DELETE FROM invites WHERE (label IS NULL AND (expires_at <= ?1 OR uses >= max_uses))
+                     OR (label IS NOT NULL AND expires_at <= ?1 - 2592000000)`),
     purgeOffline: q('DELETE FROM offline_messages WHERE expires_at <= ?'),
   };
 
@@ -199,6 +203,8 @@ export function createStore(db) {
     },
     campaigns: () => s.campaigns.all(),
     revokeInvite: (code) => s.deleteInvite.run(sha256(normalizeInvite(code))).changes > 0,
+    inviteExists: (code) => !!db.prepare('SELECT 1 FROM invites WHERE code_hash = ?').get(sha256(normalizeInvite(code))),
+    listAdmins: () => s.listAdmins.all(),
     setAdmin: (id, on) => s.setAdmin.run(on ? 1 : 0, id),
     // Make sure every configured admin name that exists is an admin.
     promoteAdmins(adminNames) {

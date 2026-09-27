@@ -39,25 +39,29 @@ Tap **Chat** in the Buddy List to see the room list.
 
 ## Letting your followers sign up (campaign codes)
 
-A campaign code is one invite code that many people can use, with a limit on sign-ups and an expiry. Post it where your audience is, such as an Instagram story (which disappears in 24 hours anyway):
+A campaign code is one invite code that many people can use, with a limit on sign-ups and an expiry. Post it where your audience is, such as an Instagram story.
 
-```sh
-npm run admin -- campaign MEM-DROP --uses 300 --hours 48   # custom code
-npm run admin -- campaign --uses 100 --hours 24            # random, harder-to-guess code
-npm run admin -- campaigns                                 # see how many signed up with each
-npm run admin -- revoke MEM-DROP                           # kill it instantly if it leaks
-```
+**In the app (admins):** go to **Setup → Admin Tools**, or **Invite → Make a campaign code**.
 
-- Run these on Railway with `railway ssh` (in the service's directory).
-- You can run several codes at once, for example one for Close Friends and one for a public story, and compare sign-ups.
-- Personal single-use invites from the **Invite** button keep working alongside campaign codes.
-- Sign-ups are limited to 30 per IP address per hour (`REGISTRATIONS_PER_HOUR`). The limit is set this high because many phones on the same carrier can share one IP.
+1. Type a code like `MEM-DROP`, or leave it blank for a random, harder-to-guess one.
+2. Pick the maximum sign-ups and how long it lasts (24 hours to 1 year), then **Create Code**.
+3. **Copy Link + Code** gives you the site address and code together, ready to paste into a story.
 
-**Admins.** Admins create and moderate public rooms from the **Chat** window. Three ways to be one:
+Your codes are listed with live sign-up counts, and **Revoke** stops a code instantly if it spreads further than you wanted. Personal single-use invites from the **Invite** button keep working alongside campaign codes.
 
-- **Configured names.** `ADMIN_SCREEN_NAMES` defaults to `mem`. These names are always admins, including existing accounts at the next restart. They're **reserved**: they can only be registered with an admin-issued single-use code (the first-run code in the logs, or `npm run invite`). A campaign code or a friend's invite can't claim them.
-- **The very first account** ever created.
-- **Promotion from the command line:** `npm run admin -- make-admin "Screen Name"`, and `remove-admin` to undo. `remove-admin` doesn't stick for configured names; change the variable instead.
+Sign-ups are limited to 30 per IP address per hour (`REGISTRATIONS_PER_HOUR`). The limit is set this high because many phones on the same carrier can share one IP.
+
+## Admins
+
+| | Owner (`mem`) | Admins | Everyone |
+|---|---|---|---|
+| Make / revoke campaign codes | ✓ | ✓ | |
+| Create and moderate public rooms | ✓ | ✓ | |
+| Make someone an admin, or remove one | ✓ | | |
+
+- **The owner** is any screen name in `ADMIN_SCREEN_NAMES` (default `mem`). Owners are always admins and add or remove admins in **Setup → Admin Tools → Admins**. The change reaches the person immediately; they don't need to sign on again.
+- **Owner names are reserved.** They can only be registered with an admin-issued single-use code: the first-run code in the deploy logs, or `npm run invite`. A campaign code or a friend's invite can't claim them.
+- **The very first account** ever created is also an admin.
 
 ## Deploy on Railway
 
@@ -70,7 +74,7 @@ npm run admin -- revoke MEM-DROP                           # kill it instantly i
    No accounts yet. Use this one-time invite code to create the first screen name:
        K7QM-2XPA-9RTF-HB3C
    ```
-5. Visit your domain, click **Get a Screen Name**, and use that code to create **`mem`**. It's an admin automatically (see *Admins* below).
+5. Visit your domain, click **Get a Screen Name**, and use that code to create **`mem`**. It's the owner automatically (see *Admins* above).
    After that, generate invites for friends from the **Invite** button, or make a campaign code (see above).
 
 No environment variables are required. The app detects Railway and then:
@@ -96,7 +100,7 @@ Railway handles HTTPS. `railway.json` sets the start command and a `/healthz` he
 
 ### Admin commands
 
-From a shell on the server (`railway ssh`), or locally against your own data directory:
+Everything here can also be done in the app (Setup → Admin Tools). For a shell on the server, use `railway ssh` (it needs an SSH key: `ssh-keygen -t ed25519`), then:
 
 ```sh
 npm run invite                              # print a fresh single-use invite code

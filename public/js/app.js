@@ -97,6 +97,9 @@ function makeWindow({
   const closeBtn = closable ? h('button', { type: 'button', 'aria-label': 'Close', text: '×' }) : null;
   const bar = h('div', { class: 'titlebar' }, backBtn, h('img', { src: icon, alt: '' }), titleEl, minBtn, closeBtn);
   const body = h('div', { class: 'window-body' });
+  // Let callers pass optional sections as null/false, like h() allows.
+  const nativeAppend = body.append.bind(body);
+  body.append = (...nodes) => nativeAppend(...nodes.filter((n) => n !== null && n !== undefined && n !== false));
   const el = h('section', { class: `window ${cls}`, role: 'dialog', 'aria-label': title }, bar, body);
   const taskBtn = task ? h('button', { class: 'task', type: 'button', text: taskLabel }) : null;
 
@@ -190,6 +193,12 @@ function makeWindow({
   cascade++;
   el.style.left = `${Math.min(left, Math.max(0, desktop.clientWidth - w))}px`;
   el.style.top = `${Math.min(top, Math.max(0, desktop.clientHeight - hgt))}px`;
+  // Windows that grow after opening (content loading in) slide up to stay on screen.
+  new ResizeObserver(() => {
+    if (isSmall()) return;
+    const overflow = el.offsetTop + el.offsetHeight - desktop.clientHeight;
+    if (overflow > 0) el.style.top = `${Math.max(0, el.offsetTop - overflow)}px`;
+  }).observe(el);
   if (background && isSmall()) {
     // On phones every window is full-screen, so never cover what the user is doing.
     el.classList.add('hidden', 'inactive');
@@ -436,13 +445,13 @@ function showSignOn(notice) {
           screenName, inviteCode: invite.value.trim(), authKey: keys.authKey,
           publicKey: id.publicKey, wrappedKey: id.wrappedKey,
         });
-        me = { screenName, norm: keys.norm, publicKey: id.publicKey, wrappedKey: id.wrappedKey, privateKey: id.privateKey, isAdmin: reg.isAdmin };
+        me = { screenName, norm: keys.norm, publicKey: id.publicKey, wrappedKey: id.wrappedKey, privateKey: id.privateKey, isAdmin: reg.isAdmin, isOwner: reg.isOwner };
       } else {
         setStep(2, 'Verifying password…');
         const r = await api('POST', '/api/login', { screenName, authKey: keys.authKey });
         setStep(3, 'Unlocking encryption keys…');
         const privateKey = await C.unwrapIdentity(r.wrappedKey, keys.wrapKey, keys.norm);
-        me = { screenName: r.screenName, norm: keys.norm, publicKey: r.publicKey, wrappedKey: r.wrappedKey, privateKey, isAdmin: r.isAdmin };
+        me = { screenName: r.screenName, norm: keys.norm, publicKey: r.publicKey, wrappedKey: r.wrappedKey, privateKey, isAdmin: r.isAdmin, isOwner: r.isOwner };
       }
       prefs.set('screenName', save.checked ? me.screenName : undefined);
       pass.value = '';
@@ -623,6 +632,18 @@ async function onServerMessage(msg) {
     case 'roomClosed':
     case 'roomRemoved':
       return onRoomEvent(msg);
+    case 'roles': {
+      // The owner changed our admin status; takes effect immediately.
+      const was = S.me.isAdmin;
+      Object.assign(S.me, { isAdmin: msg.isAdmin, isOwner: msg.isOwner });
+      if (was !== msg.isAdmin) {
+        dialogs.get('admin')?.close();
+        alertBox('Admin', msg.isAdmin
+          ? "You're now an admin. You can make campaign codes (Setup → Admin Tools) and run public chat rooms."
+          : 'You are no longer an admin.');
+      }
+      return undefined;
+    }
     case 'typing': {
       const im = S.ims.get(C.normalizeScreenName(msg.from));
       im?.typing(msg.on);
@@ -1926,6 +1947,20 @@ function awayDialog() {
   });
 }
 
+function copyButton(text, label = 'Copy') {
+  const btn = h('button', { type: 'button', text: label });
+  btn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = 'Copied!';
+    } catch {
+      btn.textContent = 'Select & copy manually';
+    }
+    setTimeout(() => { btn.textContent = label; }, 2000);
+  });
+  return btn;
+}
+
 function inviteDialog() {
   dialog('invite', { title: 'Invite a Friend' }, (win) => {
     const out = h('div');
@@ -1934,18 +1969,9 @@ function inviteDialog() {
       go.disabled = true;
       try {
         const r = await api('POST', '/api/invites', {});
-        const copy = h('button', { type: 'button', text: 'Copy' });
-        copy.addEventListener('click', async () => {
-          try {
-            await navigator.clipboard.writeText(r.code);
-            copy.textContent = 'Copied!';
-          } catch {
-            copy.textContent = 'Select & copy manually';
-          }
-        });
         out.replaceChildren(
           h('div', { class: 'code sunken', text: r.code }),
-          h('div', { class: 'row end' }, copy),
+          h('div', { class: 'row end' }, copyButton(r.code)),
           h('p', { class: 'hint', text: `Works once, expires ${new Date(r.expiresAt).toLocaleDateString()}. Send it to your friend privately along with this site's address.` }));
       } catch (err) {
         out.replaceChildren(h('p', { class: 'error', text: err.message }));
@@ -1955,7 +1981,141 @@ function inviteDialog() {
     win.body.append(
       h('p', { text: 'New people can only sign up with an invite code from an existing member.' }),
       out,
+      S.me.isAdmin ? h('p', { class: 'hint' }, 'Inviting lots of people (like your followers)? ',
+        h('button', { type: 'button', class: 'linkish', text: 'Make a campaign code', onclick: () => { win.close(); adminDialog(); } }),
+        ' that many people can use.') : null,
       h('div', { class: 'row end' }, go, h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
+  });
+}
+
+// ---- Admin tools ---------------------------------------------------------------
+
+const CAMPAIGN_DURATIONS = [
+  ['24 hours', 24], ['48 hours', 48], ['1 week', 168], ['30 days', 720], ['1 year', 8760],
+];
+
+function adminDialog() {
+  if (!S.me.isAdmin) return;
+  dialog('admin', { title: 'Admin Tools', cls: 'dialog wide' }, (win) => {
+    // -- Campaign codes
+    const code = h('input', { type: 'text', maxlength: '32', placeholder: 'Leave blank for a random code', autocapitalize: 'characters', spellcheck: 'false' });
+    const uses = h('input', { type: 'number', min: '1', max: '100000', value: '300', inputmode: 'numeric' });
+    const hours = h('select', {}, ...CAMPAIGN_DURATIONS.map(([label, n]) => h('option', { value: String(n), text: label, selected: n === 48 })));
+    const made = h('div', { role: 'status' });
+    const list = h('div', { class: 'list sunken campaigns' });
+    const create = h('button', { type: 'submit', text: 'Create Code' });
+    const form = h('form', { class: 'field' },
+      h('label', { class: 'field' }, 'Code', code),
+      h('div', { class: 'row' },
+        h('label', { class: 'field grow' }, 'Max sign-ups', uses),
+        h('label', { class: 'field grow' }, 'Lasts', hours)),
+      h('div', { class: 'row end' }, create),
+      made);
+
+    const renderCampaigns = async () => {
+      let rows;
+      try {
+        rows = (await api('GET', '/api/admin/campaigns')).campaigns;
+      } catch (err) {
+        list.replaceChildren(h('div', { class: 'error small', text: err.message }));
+        return;
+      }
+      if (!rows.length) {
+        list.replaceChildren(h('div', { class: 'muted small', text: 'No campaign codes yet.' }));
+        return;
+      }
+      list.replaceChildren(...rows.map((c) => h('div', { class: `campaign ${c.status}` },
+        h('div', { class: 'grow' },
+          h('div', { class: 'campaign-code', text: c.code }),
+          h('div', { class: 'small muted', text: `${c.uses} / ${c.maxUses} signed up · ${
+            c.status === 'expired' ? 'expired' : c.status === 'full' ? 'full' : `until ${new Date(c.expiresAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`}` })),
+        c.status === 'active' ? copyButton(c.code) : null,
+        c.status !== 'expired' ? h('button', {
+          type: 'button', text: 'Revoke',
+          onclick: async () => {
+            if (!confirm(`Stop "${c.code}" working? People who already signed up keep their accounts.`)) return;
+            try {
+              await api('POST', '/api/admin/campaigns/revoke', { code: c.code });
+              renderCampaigns();
+            } catch (err) { alertBox('Revoke', err.message); }
+          },
+        }) : null)));
+    };
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      create.disabled = true;
+      try {
+        const r = await api('POST', '/api/admin/campaigns', { code: code.value.trim(), uses: Number(uses.value), hours: Number(hours.value) });
+        code.value = '';
+        made.replaceChildren(
+          h('div', { class: 'code sunken', text: r.code }),
+          h('div', { class: 'row end' }, copyButton(`${r.code}`, 'Copy Code'), copyButton(`${location.origin}  code: ${r.code}`, 'Copy Link + Code')),
+          h('p', { class: 'hint', text: `Up to ${r.maxUses} people can sign up with it until ${new Date(r.expiresAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}. Post it with the site address: ${location.origin}` }));
+        renderCampaigns();
+      } catch (err) {
+        made.replaceChildren(h('p', { class: 'small error', text: err.message }));
+      }
+      create.disabled = false;
+    });
+
+    // -- Admins (owner only)
+    let adminsSection = null;
+    if (S.me.isOwner) {
+      const adminList = h('div', { class: 'list sunken' });
+      const name = h('input', { type: 'text', maxlength: '20', placeholder: 'Screen name', spellcheck: 'false', autocapitalize: 'off' });
+      const msg = h('p', { class: 'small', role: 'status' });
+      const renderAdmins = async () => {
+        try {
+          const { admins } = await api('GET', '/api/admin/admins');
+          adminList.replaceChildren(...admins.map((a) => h('div', { class: 'row' },
+            h('span', { class: 'grow', text: a.screenName }),
+            a.owner ? h('span', { class: 'small muted', text: 'owner' }) : h('button', {
+              type: 'button', text: 'Remove',
+              onclick: async () => {
+                if (!confirm(`Remove admin rights from ${a.screenName}?`)) return;
+                try {
+                  await api('POST', '/api/admin/admins', { screenName: a.screenName, admin: false });
+                  renderAdmins();
+                } catch (err) { alertBox('Admins', err.message); }
+              },
+            }))));
+        } catch (err) {
+          adminList.replaceChildren(h('div', { class: 'error small', text: err.message }));
+        }
+      };
+      const addForm = h('form', { class: 'row' }, name, h('button', { type: 'submit', text: 'Make Admin' }));
+      addForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (!name.value.trim()) return;
+        if (!confirm(`Make ${name.value.trim()} an admin? They'll be able to make campaign codes and run public rooms.`)) return;
+        try {
+          const r = await api('POST', '/api/admin/admins', { screenName: name.value.trim(), admin: true });
+          msg.className = 'small ok';
+          msg.textContent = `${r.screenName} is now an admin.`;
+          name.value = '';
+          renderAdmins();
+        } catch (err) {
+          msg.className = 'small error';
+          msg.textContent = err.message;
+        }
+      });
+      adminsSection = h('fieldset', {}, h('legend', { text: 'Admins' }),
+        h('p', { class: 'hint', text: 'Admins can make campaign codes and create and moderate public chat rooms. Only you can add or remove admins.' }),
+        adminList, addForm, msg);
+      renderAdmins();
+    }
+
+    win.body.append(
+      h('fieldset', {}, h('legend', { text: 'Campaign codes' }),
+        h('p', { class: 'hint', text: 'One code many people can use, like in an Instagram story. Set how many sign-ups it allows and how long it lasts. Revoke it any time if it spreads further than you wanted.' }),
+        form),
+      h('fieldset', {}, h('legend', { text: 'Your codes' }), list),
+      adminsSection,
+      h('div', { class: 'row end' }, h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
+    win.el.style.maxHeight = 'calc(100% - 8px)';
+    win.body.style.overflowY = 'auto';
+    renderCampaigns();
   });
 }
 
@@ -2051,6 +2211,10 @@ function setupDialog() {
     });
 
     win.body.append(
+      S.me.isAdmin ? h('fieldset', {}, h('legend', { text: 'Admin' }),
+        h('div', { class: 'row' },
+          h('span', { class: 'grow small', text: S.me.isOwner ? 'Campaign codes and admins' : 'Campaign codes' }),
+          h('button', { type: 'button', text: 'Admin Tools', onclick: () => { win.close(); adminDialog(); } }))) : null,
       h('fieldset', {}, h('legend', { text: 'Preferences' }),
         h('label', { class: 'check' }, soundBox, 'Play sounds'),
         h('label', { class: 'check' }, tsBox, 'Show timestamps')),
