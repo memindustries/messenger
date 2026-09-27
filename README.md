@@ -1,4 +1,4 @@
-# Buddy Messenger
+# Mem Messenger
 
 A late-90s instant messenger for you and your friends. It has a buddy list, away messages, door-creak sign-on sounds and "is typing…". Messages are **end-to-end encrypted**, and signing up needs **no email and no real name**.
 
@@ -7,6 +7,16 @@ A late-90s instant messenger for you and your friends. It has a buddy list, away
 - **End-to-end encrypted.** Messages are encrypted in the browser. The server only relays ciphertext it can't read.
 - **No chat history.** Conversations live only in the open IM window. Closing it erases them.
 - **Minimal data.** No analytics, trackers, third-party scripts, fonts or CDNs. The server keeps no logs of IPs or messages.
+
+## On your phone
+
+Open the site in Safari (iPhone) or Chrome (Android) and choose **Share → Add to Home Screen** (iPhone) or **⋮ → Add to Home screen / Install app** (Android). It then opens full-screen like a regular app.
+
+On phones, every window fills the screen:
+
+- Tap a buddy to open a chat.
+- Use **‹** or your phone's Back gesture to return to the Buddy List. Back never signs you off.
+- New messages show a small banner and a red unread count instead of covering what you're doing.
 
 ## Deploy on Railway
 

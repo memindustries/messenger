@@ -23,6 +23,8 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 export const PBKDF2_ITERATIONS = 600_000;
+// Protocol label mixed into every derived key. It is not user-facing and must
+// never change, or existing accounts could no longer sign in or decrypt.
 const PREFIX = 'buddy-messenger/v1';
 const CURVE = { name: 'ECDH', namedCurve: 'P-256' };
 

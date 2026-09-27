@@ -1,0 +1,17 @@
+{
+  "name": "Mem Messenger",
+  "short_name": "Mem",
+  "description": "Private, end-to-end encrypted messenger for friends.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#008080",
+  "theme_color": "#000080",
+  "icons": [
+    { "src": "/img/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/img/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/img/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/img/buddy.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

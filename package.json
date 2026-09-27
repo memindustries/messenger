@@ -1,5 +1,5 @@
 {
-  "name": "buddy-messenger",
+  "name": "mem-messenger",
   "version": "1.0.0",
   "private": true,
   "description": "A private, end-to-end encrypted, AIM-style instant messenger for small groups of friends.",

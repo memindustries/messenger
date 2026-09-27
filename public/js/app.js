@@ -6,7 +6,7 @@ import { sounds, unlockAudio, setSoundEnabled } from './sounds.js';
 
 const MAX_TEXT = 4000;
 const OFFLINE_MAX_AGE = 8 * 86400_000;
-const APP_NAME = document.getElementById('app-name')?.textContent || 'Buddy Messenger';
+const APP_NAME = document.getElementById('app-name')?.textContent || 'Mem Messenger';
 
 // Element builder. User-provided strings only ever become text nodes.
 function h(tag, attrs = {}, ...children) {
@@ -72,22 +72,41 @@ const tasks = document.getElementById('tasks');
 const windows = new Set();
 let zTop = 10;
 let cascade = 0;
-const isSmall = () => matchMedia('(max-width: 640px)').matches;
+// Keep in sync with the "small screen" media query in aim.css.
+const SMALL_MQ = matchMedia('(max-width: 640px), (max-height: 500px) and (pointer: coarse)');
+const COARSE_MQ = matchMedia('(pointer: coarse)');
+const isSmall = () => SMALL_MQ.matches;
+const isTouch = () => SMALL_MQ.matches || COARSE_MQ.matches;
 
-function makeWindow({ title, cls = '', icon = '/img/buddy.svg', x, y, onClose, closable = true, task = true }) {
+function topWindow() {
+  let top = null;
+  for (const w of windows) {
+    if (w.visible && (!top || Number(w.el.style.zIndex) > Number(top.el.style.zIndex))) top = w;
+  }
+  return top;
+}
+
+// back: what the mobile "‹" button does ('minimize' keeps the window, 'close' removes it).
+function makeWindow({
+  title, taskLabel = title, cls = '', icon = '/img/buddy.svg', x, y,
+  onClose, onFocus, closable = true, task = true, back = null, background = false,
+}) {
   const titleEl = h('span', { class: 'title', text: title });
-  const minBtn = h('button', { type: 'button', 'aria-label': 'Minimize', text: '_' });
+  const backBtn = back ? h('button', { type: 'button', class: 'back', 'aria-label': 'Back', text: '‹' }) : null;
+  const minBtn = h('button', { type: 'button', class: 'min', 'aria-label': 'Minimize', text: '_' });
   const closeBtn = closable ? h('button', { type: 'button', 'aria-label': 'Close', text: '×' }) : null;
-  const bar = h('div', { class: 'titlebar' }, h('img', { src: icon, alt: '' }), titleEl, minBtn, closeBtn);
+  const bar = h('div', { class: 'titlebar' }, backBtn, h('img', { src: icon, alt: '' }), titleEl, minBtn, closeBtn);
   const body = h('div', { class: 'window-body' });
   const el = h('section', { class: `window ${cls}`, role: 'dialog', 'aria-label': title }, bar, body);
-  const taskBtn = task ? h('button', { class: 'task', type: 'button', text: title }) : null;
+  const taskBtn = task ? h('button', { class: 'task', type: 'button', text: taskLabel }) : null;
 
   const win = {
-    el, body,
+    el, body, taskBtn,
     setTitle(t) {
       titleEl.textContent = t;
       el.setAttribute('aria-label', t);
+    },
+    setTaskLabel(t) {
       if (taskBtn) taskBtn.textContent = t;
     },
     focus() {
@@ -98,13 +117,19 @@ function makeWindow({ title, cls = '', icon = '/img/buddy.svg', x, y, onClose, c
         w.taskBtn?.classList.toggle('active', w === win);
       }
       taskBtn?.classList.remove('flash');
+      onFocus?.();
     },
     minimize() {
       el.classList.add('hidden');
       taskBtn?.classList.remove('active');
+      topWindow()?.focus();
+    },
+    back() {
+      if (back === 'close') win.close();
+      else win.minimize();
     },
     flash() {
-      if (el.classList.contains('hidden') || el.classList.contains('inactive')) taskBtn?.classList.add('flash');
+      if (!win.active) taskBtn?.classList.add('flash');
     },
     close() {
       if (!windows.has(win)) return;
@@ -112,18 +137,23 @@ function makeWindow({ title, cls = '', icon = '/img/buddy.svg', x, y, onClose, c
       el.remove();
       taskBtn?.remove();
       onClose?.();
+      topWindow()?.focus();
     },
     get visible() {
       return !el.classList.contains('hidden');
     },
-    taskBtn,
+    // Visible, frontmost, and the page itself is being looked at.
+    get active() {
+      return win.visible && !el.classList.contains('inactive') && !document.hidden;
+    },
   };
 
+  backBtn?.addEventListener('click', () => win.back());
   minBtn.addEventListener('click', () => win.minimize());
   closeBtn?.addEventListener('click', () => win.close());
-  el.addEventListener('pointerdown', () => win.focus());
+  el.addEventListener('pointerdown', () => { if (!win.active) win.focus(); });
   taskBtn?.addEventListener('click', () => {
-    if (win.visible && !el.classList.contains('inactive')) win.minimize();
+    if (win.active && !isSmall()) win.minimize();
     else win.focus();
   });
   el.addEventListener('keydown', (e) => {
@@ -160,7 +190,14 @@ function makeWindow({ title, cls = '', icon = '/img/buddy.svg', x, y, onClose, c
   cascade++;
   el.style.left = `${Math.min(left, Math.max(0, desktop.clientWidth - w))}px`;
   el.style.top = `${Math.min(top, Math.max(0, desktop.clientHeight - hgt))}px`;
-  win.focus();
+  if (background && isSmall()) {
+    // On phones every window is full-screen, so never cover what the user is doing.
+    el.classList.add('hidden', 'inactive');
+    el.style.zIndex = '1';
+    taskBtn?.classList.add('flash');
+  } else {
+    win.focus();
+  }
   return win;
 }
 
@@ -172,15 +209,15 @@ function dialog(key, opts, build) {
     existing.focus();
     return existing;
   }
-  const win = makeWindow({ cls: 'dialog', ...opts, onClose: () => dialogs.delete(key) });
+  const win = makeWindow({ cls: 'dialog', back: 'close', ...opts, onClose: () => dialogs.delete(key) });
   dialogs.set(key, win);
   build(win);
-  win.body.querySelector('input, textarea, select, button')?.focus();
+  if (!isTouch()) win.body.querySelector('input, textarea, select, button')?.focus();
   return win;
 }
 
 function alertBox(title, message) {
-  const win = makeWindow({ title, cls: 'dialog' });
+  const win = makeWindow({ title, cls: 'dialog', back: 'close' });
   const ok = h('button', { type: 'button', text: 'OK', onclick: () => win.close() });
   win.body.append(h('p', { text: message }), h('div', { class: 'row end' }, ok));
   ok.focus();
@@ -191,6 +228,54 @@ const clock = document.getElementById('clock');
 const tick = () => { clock.textContent = timeFmt(Date.now()); };
 tick();
 setInterval(tick, 15_000);
+
+// Size the app to the *visible* viewport so the on-screen keyboard never hides
+// the message box, and hide the taskbar while typing on a phone.
+const vv = window.visualViewport;
+let fullHeight = 0;
+let lastWidth = 0;
+function fitViewport() {
+  const height = vv ? vv.height : window.innerHeight;
+  const width = vv ? vv.width : window.innerWidth;
+  if (width !== lastWidth) {
+    fullHeight = 0; // rotated
+    lastWidth = width;
+  }
+  fullHeight = Math.max(fullHeight, height);
+  const root = document.documentElement.style;
+  root.setProperty('--app-h', `${Math.round(height)}px`);
+  root.setProperty('--app-top', `${Math.round(vv ? vv.offsetTop : 0)}px`);
+  document.body.classList.toggle('kb-open', isTouch() && height < fullHeight * 0.8);
+}
+vv?.addEventListener('resize', fitViewport);
+vv?.addEventListener('scroll', fitViewport);
+window.addEventListener('resize', fitViewport);
+fitViewport();
+
+// Small tappable notice, used on phones instead of popping a window over you.
+function toast(text, onclick) {
+  document.querySelector('.toast')?.remove();
+  const el = h('button', { type: 'button', class: 'toast', text });
+  const remove = () => el.remove();
+  el.addEventListener('click', () => {
+    remove();
+    onclick?.();
+  });
+  document.body.append(el);
+  setTimeout(remove, 6000);
+}
+
+// The browser's Back button / swipe would leave the page, which signs you off
+// (keys only live in memory). While signed on, Back closes the top window instead.
+function armBackTrap() {
+  history.pushState({ bm: true }, '');
+}
+window.addEventListener('popstate', () => {
+  if (!S) return;
+  const top = topWindow();
+  if (top && top !== S.buddyWin) top.back();
+  armBackTrap();
+});
 
 // ===========================================================================
 // Session state (memory only; nothing decrypted is ever written to disk)
@@ -212,6 +297,7 @@ function newState(me) {
     deliveredTimer: null,
     away: { on: false, message: '' },
     autoReplied: new Set(),
+    unread: new Map(), // norm -> count of unseen messages
     collapsed: new Set(prefs.get('collapsed', [])),
     selected: null,
     ws: null,
@@ -373,7 +459,7 @@ function showSignOn(notice) {
     status.className = 'status-line error';
     status.textContent = notice;
   }
-  (saved ? pass : name).focus();
+  if (!isTouch()) (saved ? pass : name).focus();
 }
 
 // ===========================================================================
@@ -384,6 +470,7 @@ async function startSession(me) {
   setSoundEnabled(prefs.get('sounds', true));
   document.title = `${me.screenName} - ${APP_NAME}`;
   buildBuddyList();
+  armBackTrap();
   try {
     await loadBuddies();
   } catch (err) {
@@ -454,7 +541,7 @@ function connect() {
     onServerMessage(msg).catch((err) => console.error(err));
   });
   ws.addEventListener('close', async (e) => {
-    if (S !== state || state.signingOff) return;
+    if (S !== state || state.signingOff || state.ws !== ws) return;
     if (e.code === 4001) return signOff('You were signed off (signed on elsewhere, password changed, or account removed).', { skipServer: true });
     setConn('Connection lost. Reconnecting…');
     try {
@@ -567,9 +654,18 @@ async function receiveIm(msg) {
   }
   if (typeof payload?.text !== 'string' || typeof payload.ts !== 'number') return;
   if (Date.now() - payload.ts > OFFLINE_MAX_AGE) return; // stale or replayed
-  im.add(b.screenName, 'them', payload.text.slice(0, MAX_TEXT), payload.ts, { auto: payload.auto === true, offline: msg.offline });
+  const text = payload.text.slice(0, MAX_TEXT);
+  im.add(b.screenName, 'them', text, payload.ts, { auto: payload.auto === true, offline: msg.offline });
   sounds.imIn();
-  im.win.flash();
+  if (!im.win.active) {
+    S.unread.set(b.norm, (S.unread.get(b.norm) ?? 0) + 1);
+    im.updateTask();
+    renderBuddyList();
+    im.win.flash();
+    if (isSmall() && !document.hidden) {
+      toast(`${b.screenName}: ${text.length > 80 ? `${text.slice(0, 80)}…` : text}`, () => openIm(b));
+    }
+  }
   titleFlash(b.screenName);
   if (S.away.on && !payload.auto && !S.autoReplied.has(b.norm)) {
     S.autoReplied.add(b.norm);
@@ -614,7 +710,18 @@ function stopTitleFlash() {
   flashTimer = null;
   document.title = S ? `${S.me.screenName} - ${APP_NAME}` : APP_NAME;
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) stopTitleFlash(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !S) return;
+  stopTitleFlash();
+  // Phones often kill the connection while the app is in the background.
+  if (!S.ws || S.ws.readyState >= WebSocket.CLOSING) {
+    clearTimeout(S.wsTimer);
+    S.wsRetry = 0;
+    connect();
+  }
+  // Mark whatever conversation is on screen as read.
+  topWindow()?.focus();
+});
 
 // ===========================================================================
 // Buddy List window
@@ -630,7 +737,7 @@ function setConn(text) {
 
 function buildBuddyList() {
   const win = makeWindow({
-    title: `${S.me.screenName}'s Buddy List`, cls: 'buddylist', closable: false,
+    title: `${S.me.screenName}'s Buddy List`, taskLabel: 'Buddies', cls: 'buddylist', closable: false,
     x: Math.max(0, desktop.clientWidth - 260), y: 16,
   });
   S.buddyWin = win;
@@ -736,8 +843,12 @@ function renderBuddyList() {
       h('span', { class: 'name', text: b.screenName }),
       b.away ? h('span', { class: 'tag', text: '(away)' }) : null,
       b.keyStatus === 'changed' ? h('span', { class: 'warn', text: '⚠', title: 'Encryption key changed!' }) : null,
-      b.keyStatus === 'verified' ? h('span', { class: 'tag', text: '✔', title: 'Verified' }) : null);
-    el.addEventListener('click', () => select(b.norm));
+      b.keyStatus === 'verified' ? h('span', { class: 'tag', text: '✔', title: 'Verified' }) : null,
+      S.unread.get(b.norm) ? h('span', { class: 'badge', text: String(S.unread.get(b.norm)), 'aria-label': 'unread messages' }) : null);
+    el.addEventListener('click', () => {
+      select(b.norm);
+      if (isTouch()) openIm(b);
+    });
     el.addEventListener('dblclick', () => openIm(b));
     return el;
   };
@@ -777,25 +888,38 @@ async function respond(name, accept) {
 
 function openIm(b, { focus = true } = {}) {
   let im = S.ims.get(b.norm);
-  if (!im) im = createIm(b);
+  if (!im) im = createIm(b, { background: !focus });
   if (focus) {
     im.win.focus();
-    im.input.focus();
-  } else if (!im.win.visible) {
+    if (!isTouch()) im.input.focus();
+  } else if (!im.win.visible && !isSmall()) {
     im.win.el.classList.remove('hidden');
-    im.win.flash();
   }
   return im;
 }
 
-function createIm(buddy) {
+function createIm(buddy, { background = false } = {}) {
   let b = buddy;
   const norm = b.norm;
-  const win = makeWindow({ title: `${b.screenName} - Instant Message`, cls: 'im', onClose: () => S?.ims.delete(norm) });
+  let im;
+  const win = makeWindow({
+    title: `${b.screenName} - Instant Message`, taskLabel: b.screenName, cls: 'im', back: 'minimize', background,
+    onClose: () => {
+      S?.ims.delete(norm);
+      S?.unread.delete(norm);
+      renderBuddyList();
+    },
+    onFocus: () => {
+      if (im && S?.unread.delete(norm)) {
+        im.updateTask();
+        renderBuddyList();
+      }
+    },
+  });
   const transcript = h('div', { class: `transcript sunken${prefs.get('timestamps', true) ? '' : ' hide-ts'}`, role: 'log', 'aria-live': 'polite' });
   const status = h('div', { class: 'statusbar' });
   const lock = h('button', { type: 'button', class: 'lock' });
-  const input = h('textarea', { maxlength: String(MAX_TEXT), 'aria-label': 'Message', placeholder: 'Type a message…' });
+  const input = h('textarea', { maxlength: String(MAX_TEXT), 'aria-label': 'Message', placeholder: 'Type a message…', enterkeyhint: 'send', rows: '2' });
   const send = h('button', { type: 'button', text: 'Send' });
   let typingTimer = null;
   let typingSentAt = 0;
@@ -808,12 +932,18 @@ function createIm(buddy) {
     transcript, status,
     h('div', { class: 'compose' }, input, send));
 
+  let stick = true;
   const scrollDown = () => { transcript.scrollTop = transcript.scrollHeight; };
+  transcript.addEventListener('scroll', () => {
+    stick = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 40;
+  });
+  new ResizeObserver(() => { if (stick) scrollDown(); }).observe(transcript);
   const doSend = async () => {
     const text = input.value.replace(/\s+$/, '');
     if (!text.trim() || !b) return;
     if (text.length > MAX_TEXT) return;
     input.value = '';
+    input.style.height = '';
     clearTimeout(stopTypingTimer);
     typingSentAt = 0;
     wsSend({ t: 'typing', to: b.screenName, on: false });
@@ -828,6 +958,11 @@ function createIm(buddy) {
     }
   });
   input.addEventListener('input', () => {
+    if (isSmall()) {
+      // Grow with the text on phones, up to the CSS max-height.
+      input.style.height = 'auto';
+      input.style.height = `${input.scrollHeight + 4}px`;
+    }
     if (!b || !b.online) return;
     const now = Date.now();
     if (now - typingSentAt > 3000) {
@@ -850,8 +985,12 @@ function createIm(buddy) {
     else status.textContent = '';
   };
 
-  const im = {
+  im = {
     win, input,
+    updateTask() {
+      const n = S?.unread.get(norm) ?? 0;
+      win.setTaskLabel(b ? `${b.screenName}${n ? ` (${n})` : ''}` : win.taskBtn?.textContent);
+    },
     add(who, side, text, ts, { auto = false, offline = false } = {}) {
       const line = h('div', { class: `line${auto ? ' auto' : ''}` },
         h('span', { class: `who ${side}`, text: auto ? `Auto response from ${who}` : who }),
@@ -859,7 +998,7 @@ function createIm(buddy) {
         ': ',
         h('span', { class: 'text', text }));
       transcript.append(line);
-      scrollDown();
+      if (stick || side === 'me') scrollDown();
       if (side === 'them') {
         typingOn = false;
         renderStatus();
@@ -878,6 +1017,7 @@ function createIm(buddy) {
     update(next) {
       b = next;
       if (b) win.setTitle(`${b.screenName} - Instant Message`);
+      im.updateTask();
       const ks = b?.keyStatus;
       lock.className = `lock ${ks === 'verified' ? 'verified' : ks === 'changed' ? 'changed' : ''}`;
       lock.textContent = !b ? '🔒 Encrypted'
@@ -1193,6 +1333,12 @@ function setupDialog() {
   showSignOn();
 })();
 
-window.addEventListener('beforeunload', () => {
+// Reloading or closing the tab signs you off, so ask first (desktop browsers honor this).
+window.addEventListener('beforeunload', (e) => {
+  if (!S) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+window.addEventListener('pagehide', () => {
   if (S) navigator.sendBeacon?.('/api/logout', new Blob(['{}'], { type: 'application/json' }));
 });

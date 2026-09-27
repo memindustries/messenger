@@ -25,7 +25,7 @@ if (store.userCount() === 0 && store.countAllInvites() === 0) {
 }
 
 app.server.listen(config.port, config.host, () => {
-  console.log(`Buddy Messenger listening on http://${config.host}:${config.port}`);
+  console.log(`Mem Messenger listening on http://${config.host}:${config.port}`);
   if (!config.cookieSecure) console.log('Development mode: cookies are not marked Secure. Do not expose this to the internet.');
 });
 
