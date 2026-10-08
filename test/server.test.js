@@ -12,7 +12,7 @@ let base;
 let origin;
 
 before(async () => {
-  const config = { ...loadConfig({ NODE_ENV: 'development', REGISTRATIONS_PER_HOUR: '1000' }), dbFile: ':memory:' };
+  const config = { ...loadConfig({ NODE_ENV: 'development', REGISTRATIONS_PER_HOUR: '1000', INVITE_ONLY: '1' }), dbFile: ':memory:' };
   app = createApp({ config, db: openDb(':memory:') });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   origin = `http://127.0.0.1:${app.server.address().port}`;
@@ -21,8 +21,10 @@ before(async () => {
 
 after(() => app.close());
 
-async function req(method, path, body, cookie, extraHeaders = {}) {
-  const res = await fetch(base + path, {
+async function req(method, path, body, cookie, extraHeaders = {}, url = base) {
+  // Everyone in these tests is an adult who agreed to the rules, unless a test says otherwise.
+  if (path === '/api/register' && body && body.adult === undefined) body = { ...body, adult: true };
+  const res = await fetch(url + path, {
     method,
     headers: {
       Origin: origin,
@@ -520,4 +522,41 @@ test('only the owner ("mem") can make and remove admins; changes reach the perso
   assert.equal((await wh.next((m) => m.t === 'roles')).isAdmin, false);
   assert.equal((await req('POST', '/api/admin/admins', { screenName: 'mem', admin: false }, mem.cookie)).status, 400);
   wh.close();
+});
+
+// ---------------------------------------------------------------------------
+// Open sign-up (the default): no invite code needed
+
+test('open sign-up: no code needed, 18+ agreement required, reserved names and admin rights protected', async () => {
+  const open = createApp({ config: { ...loadConfig({ NODE_ENV: 'development', REGISTRATIONS_PER_HOUR: '1000' }), dbFile: ':memory:' }, db: openDb(':memory:') });
+  await new Promise((r) => open.server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${open.server.address().port}`;
+  const signUp = async (name, extra = {}) => {
+    const keys = await C.deriveAccountKeys(name, 'long password 1', ITER);
+    const id = await C.generateIdentity(keys.wrapKey, keys.norm);
+    return fetch(url + '/api/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: url },
+      body: JSON.stringify({ screenName: name, authKey: keys.authKey, publicKey: id.publicKey, wrappedKey: id.wrappedKey, ...extra }),
+    }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  };
+  try {
+    assert.equal((await (await fetch(url + '/api/config')).json()).inviteOnly, false);
+    // Must confirm 18+ and the rules.
+    assert.equal((await signUp('Stranger One')).status, 400);
+    assert.equal((await signUp('Stranger One', { adult: false })).status, 400);
+    // A stranger who signs up first does NOT become admin.
+    const first = await signUp('Stranger One', { adult: true });
+    assert.equal(first.status, 201);
+    assert.equal(first.body.isAdmin, false);
+    // Nobody can claim "mem" without the server's code; a bogus code is rejected outright.
+    assert.equal((await signUp('mem', { adult: true })).status, 409);
+    assert.equal((await signUp('mem', { adult: true, inviteCode: 'NOPE-NOPE-NOPE-NOPE' })).status, 403);
+    const { code } = open.store.createInvite(null, 60_000);
+    const mem = await signUp('mem', { adult: true, inviteCode: code });
+    assert.equal(mem.status, 201);
+    assert.deepEqual([mem.body.isAdmin, mem.body.isOwner], [true, true]);
+  } finally {
+    open.close();
+  }
 });

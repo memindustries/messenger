@@ -3,7 +3,8 @@
 A late-90s instant messenger for you and your friends. It has a buddy list, away messages, door-creak sign-on sounds and "is typing…". Messages are **end-to-end encrypted**, and signing up needs **no email and no real name**.
 
 - **Screen name + password only.** No email, phone number or real name, ever.
-- **Invite-only.** New people need an invite code: a personal one from a member, or a campaign code you post (e.g. in an Instagram story).
+- **Open sign-up, 18+.** Anyone can create a screen name after confirming they're 18 or older and agreeing to the rules. Invite-only mode is one setting away (`INVITE_ONLY=1`).
+- **Text only.** No pictures or files, which keeps the app a poor tool for sharing illegal images.
 - **End-to-end encrypted.** IMs and private chat rooms are encrypted in the browser. The server only relays ciphertext it can't read.
 - **Chat rooms.** Public rooms anyone can join, and invite-only private rooms that are end-to-end encrypted.
 - **No chat history.** Conversations live only in the open window. Closing it erases them.
@@ -37,7 +38,15 @@ Tap **Chat** in the Buddy List to see the room list.
 - Tap a name in a room's member list to IM them, add them as a buddy, or (moderators) remove them. Removed people can't rejoin that room.
 - Messages from people you've blocked are hidden in rooms.
 
-## Letting your followers sign up (campaign codes)
+## Sign-up
+
+By default **anyone can sign up**: pick a screen name and password, tick "I'm 18 or older and agree to the rules," done. The **Invite** button just shares the site's address.
+
+The rules shown at sign-up are in `RULES` at the top of `public/js/app.js`.
+
+To close sign-ups (for example if spammers show up), set `INVITE_ONLY=1` in Railway's Variables. New people then need a code, and the invite and campaign-code tools below come back.
+
+## Campaign codes (invite-only mode)
 
 A campaign code is one invite code that many people can use, with a limit on sign-ups and an expiry. Post it where your audience is, such as an Instagram story.
 
@@ -61,7 +70,7 @@ Sign-ups are limited to 30 per IP address per hour (`REGISTRATIONS_PER_HOUR`). T
 
 - **The owner** is any screen name in `ADMIN_SCREEN_NAMES` (default `mem`). Owners are always admins and add or remove admins in **Setup → Admin Tools → Admins**. The change reaches the person immediately; they don't need to sign on again.
 - **Owner names are reserved.** They can only be registered with an admin-issued single-use code: the first-run code in the deploy logs, or `npm run invite`. A campaign code or a friend's invite can't claim them.
-- **The very first account** ever created is also an admin.
+- **The very first account** is also an admin, but only if it was created with the server's own first-run code. With open sign-up, a stranger who happens to sign up first gets no special powers.
 
 ## Deploy on Railway
 
@@ -71,10 +80,11 @@ Sign-ups are limited to 30 per IP address per hour (`REGISTRATIONS_PER_HOUR`). T
 3. Under **Settings → Networking**, click **Generate Domain** (or attach your own domain).
 4. Open the **Deploy Logs**. On first start the server prints a one-time invite code:
    ```
-   No accounts yet. Use this one-time invite code to create the first screen name:
+   No accounts yet. Use this one-time code in the "Invite code" box when signing up
+   as mem to become the admin:
        K7QM-2XPA-9RTF-HB3C
    ```
-5. Visit your domain, click **Get a Screen Name**, and use that code to create **`mem`**. It's the owner automatically (see *Admins* above).
+5. Visit your domain and click **Get a Screen Name**. Enter `mem`, click **Have an invite code?**, and paste that code. `mem` is then the owner (see *Admins* above), and nobody else can register that name.
    After that, generate invites for friends from the **Invite** button, or make a campaign code (see above).
 
 No environment variables are required. The app detects Railway and then:
@@ -96,6 +106,7 @@ Railway handles HTTPS. `railway.json` sets the start command and a `/healthz` he
 | `INVITE_TTL_DAYS` | `7` | Invite code lifetime. |
 | `REGISTRATIONS_PER_HOUR` | `30` | Sign-ups allowed per IP per hour. |
 | `ADMIN_SCREEN_NAMES` | `mem` | Comma-separated screen names that are always admins and reserved for admin-issued invites. Set to empty to turn off. |
+| `INVITE_ONLY` | off | `1` = new people need an invite code (personal or campaign). |
 | `ALLOWED_ORIGINS` | *(same host)* | Comma-separated origins allowed to call the API, if you serve from several domains. |
 
 ### Admin commands

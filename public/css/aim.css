@@ -228,6 +228,10 @@ legend { padding: 0 3px; }
 .campaign.expired, .campaign.full { color: var(--shadow); }
 form.row input { flex: 1; }
 
+.have-code { align-self: flex-start; }
+.rules { margin: 0; padding-left: 20px; line-height: 1.4; }
+.rules li { margin: 4px 0; }
+
 /* ---- Taskbar ---------------------------------------------------------- */
 #taskbar {
   position: absolute; left: 0; right: 0; bottom: 0;

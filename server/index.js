@@ -18,12 +18,12 @@ const store = createStore(db);
 if (store.userCount() === 0 && store.countAllInvites() === 0) {
   const { code } = store.createInvite(null, config.inviteTtlMs);
   console.log('');
-  console.log('  No accounts yet. Use this one-time invite code to create the first screen name:');
+  const names = config.adminNames.join(', ');
+  console.log('  No accounts yet. Use this one-time code in the "Invite code" box when signing up');
+  console.log(`  ${names ? `as ${names} ` : ''}to become the admin:`);
   console.log(`      ${code}`);
-  if (config.adminNames.length) {
-    console.log(`  Admin screen names (reserved for codes like this one): ${config.adminNames.join(', ')}`);
-  }
-  console.log('  (Generate more later from inside the app, or with `npm run invite`.)');
+  if (names) console.log(`  (${names} can only be registered with a code like this, so nobody else can claim it.)`);
+  if (!config.inviteOnly) console.log('  Everyone else can sign up without a code.');
   console.log('');
 }
 

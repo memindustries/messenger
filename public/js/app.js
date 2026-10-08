@@ -8,6 +8,24 @@ const MAX_TEXT = 4000;
 const OFFLINE_MAX_AGE = 8 * 86400_000;
 const APP_NAME = document.getElementById('app-name')?.textContent || 'Mem Messenger';
 
+// Settings from the server (fetched at boot). inviteOnly: sign-up needs a code.
+const SITE = { inviteOnly: false };
+
+const RULES = [
+  'You must be 18 or older.',
+  'No sexual content involving minors, ever. Accounts are banned and reported to the authorities.',
+  'No threats, harassment, hate, or sharing other people\'s private info.',
+  'Nothing illegal: no selling drugs or weapons, no scams.',
+  'Admins can remove anyone who breaks these rules.',
+];
+
+function showRules() {
+  const win = makeWindow({ title: 'Rules', cls: 'dialog', back: 'close' });
+  const ok = h('button', { type: 'button', text: 'OK', onclick: () => win.close() });
+  win.body.append(h('ol', { class: 'rules' }, ...RULES.map((r) => h('li', { text: r }))), h('div', { class: 'row end' }, ok));
+  ok.focus();
+}
+
 // Element builder. User-provided strings only ever become text nodes.
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -384,10 +402,25 @@ function showSignOn(notice) {
   const steps = h('div', { class: 'steps' }, h('span', { text: '1' }), h('span', { text: '2' }), h('span', { text: '3' }));
   const submit = h('button', { type: 'submit', text: 'Sign On' });
   const toggle = h('button', { type: 'button', class: 'linkish' });
+  const adult = h('input', { type: 'checkbox' });
+  const inviteLabel = h('label', { class: 'field' }, SITE.inviteOnly ? 'Invite Code' : 'Invite code (optional)', invite);
+  const haveCode = h('button', { type: 'button', class: 'linkish small have-code', text: 'Have an invite code?' });
+  if (!SITE.inviteOnly) {
+    inviteLabel.hidden = true;
+    haveCode.addEventListener('click', () => {
+      inviteLabel.hidden = false;
+      haveCode.hidden = true;
+      invite.focus();
+    });
+  } else {
+    haveCode.hidden = true;
+  }
   const regFields = h('div', { class: 'field' },
     h('label', { class: 'field' }, 'Confirm Password', pass2),
-    h('label', { class: 'field' }, 'Invite Code', invite),
-    h('p', { class: 'hint', text: 'No email or real name needed. There is no password reset: if you forget your password, the account (and its encryption keys) cannot be recovered.' }));
+    inviteLabel, haveCode,
+    h('div', { class: 'check' }, h('label', { class: 'check' }, adult, "I'm 18 or older and agree to the"),
+      h('button', { type: 'button', class: 'linkish', text: 'rules', onclick: showRules })),
+    h('p', { class: 'hint', text: 'No email or real name needed. There is no password reset: if you forget your password, the account cannot be recovered.' }));
 
   const setStep = (n, text) => {
     [...steps.children].forEach((s, i) => s.classList.toggle('on', i < n));
@@ -431,7 +464,8 @@ function showSignOn(notice) {
       }
       if (password.length < 10) return fail('Use a password of at least 10 characters.');
       if (password !== pass2.value) return fail("Passwords don't match.");
-      if (!invite.value.trim()) return fail('You need an invite code from a friend.');
+      if (SITE.inviteOnly && !invite.value.trim()) return fail('You need an invite code from a friend.');
+      if (!adult.checked) return fail('Please confirm you are 18 or older and agree to the rules.');
     }
     submit.disabled = true;
     try {
@@ -442,7 +476,7 @@ function showSignOn(notice) {
         setStep(2, 'Generating encryption keys…');
         const id = await C.generateIdentity(keys.wrapKey, keys.norm);
         const reg = await api('POST', '/api/register', {
-          screenName, inviteCode: invite.value.trim(), authKey: keys.authKey,
+          screenName, inviteCode: invite.value.trim(), adult: adult.checked, authKey: keys.authKey,
           publicKey: id.publicKey, wrappedKey: id.wrappedKey,
         });
         me = { screenName, norm: keys.norm, publicKey: id.publicKey, wrappedKey: id.wrappedKey, privateKey: id.privateKey, isAdmin: reg.isAdmin, isOwner: reg.isOwner };
@@ -467,7 +501,7 @@ function showSignOn(notice) {
     h('div', { class: 'hero sunken' },
       h('img', { src: '/img/buddy.svg', alt: '' }),
       h('div', { class: 'brand', text: APP_NAME }),
-      h('div', { class: 'tag', text: '🔒 End-to-end encrypted · friends only' })),
+      h('div', { class: 'tag', text: '🔒 Encrypted IMs · no email needed' })),
     form);
   setMode('signin');
   if (notice) {
@@ -639,7 +673,7 @@ async function onServerMessage(msg) {
       if (was !== msg.isAdmin) {
         dialogs.get('admin')?.close();
         alertBox('Admin', msg.isAdmin
-          ? "You're now an admin. You can make campaign codes (Setup → Admin Tools) and run public chat rooms."
+          ? `You're now an admin. You can create and moderate public chat rooms${SITE.inviteOnly ? ' and make campaign codes (Setup → Admin Tools)' : ''}.`
           : 'You are no longer an admin.');
       }
       return undefined;
@@ -1962,6 +1996,16 @@ function copyButton(text, label = 'Copy') {
 }
 
 function inviteDialog() {
+  if (!SITE.inviteOnly) {
+    dialog('invite', { title: 'Invite a Friend' }, (win) => {
+      win.body.append(
+        h('p', { text: 'Anyone can sign up. Just send them the link:' }),
+        h('div', { class: 'code sunken', text: location.origin }),
+        h('div', { class: 'row end' }, copyButton(location.origin, 'Copy Link'),
+          h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
+    });
+    return;
+  }
   dialog('invite', { title: 'Invite a Friend' }, (win) => {
     const out = h('div');
     const go = h('button', { type: 'button', text: 'Create Invite Code' });
@@ -1995,7 +2039,7 @@ const CAMPAIGN_DURATIONS = [
 ];
 
 function adminDialog() {
-  if (!S.me.isAdmin) return;
+  if (!S.me.isAdmin || (!SITE.inviteOnly && !S.me.isOwner)) return;
   dialog('admin', { title: 'Admin Tools', cls: 'dialog wide' }, (win) => {
     // -- Campaign codes
     const code = h('input', { type: 'text', maxlength: '32', placeholder: 'Leave blank for a random code', autocapitalize: 'characters', spellcheck: 'false' });
@@ -2088,7 +2132,7 @@ function adminDialog() {
       addForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (!name.value.trim()) return;
-        if (!confirm(`Make ${name.value.trim()} an admin? They'll be able to make campaign codes and run public rooms.`)) return;
+        if (!confirm(`Make ${name.value.trim()} an admin? They'll be able to ${SITE.inviteOnly ? 'make campaign codes and ' : ''}run public rooms.`)) return;
         try {
           const r = await api('POST', '/api/admin/admins', { screenName: name.value.trim(), admin: true });
           msg.className = 'small ok';
@@ -2101,21 +2145,22 @@ function adminDialog() {
         }
       });
       adminsSection = h('fieldset', {}, h('legend', { text: 'Admins' }),
-        h('p', { class: 'hint', text: 'Admins can make campaign codes and create and moderate public chat rooms. Only you can add or remove admins.' }),
+        h('p', { class: 'hint', text: `Admins can ${SITE.inviteOnly ? 'make campaign codes and ' : ''}create and moderate public chat rooms. Only you can add or remove admins.` }),
         adminList, addForm, msg);
       renderAdmins();
     }
 
+    // Campaign codes only matter while sign-up needs a code.
     win.body.append(
-      h('fieldset', {}, h('legend', { text: 'Campaign codes' }),
+      SITE.inviteOnly ? h('fieldset', {}, h('legend', { text: 'Campaign codes' }),
         h('p', { class: 'hint', text: 'One code many people can use, like in an Instagram story. Set how many sign-ups it allows and how long it lasts. Revoke it any time if it spreads further than you wanted.' }),
-        form),
-      h('fieldset', {}, h('legend', { text: 'Your codes' }), list),
+        form) : null,
+      SITE.inviteOnly ? h('fieldset', {}, h('legend', { text: 'Your codes' }), list) : null,
       adminsSection,
       h('div', { class: 'row end' }, h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
     win.el.style.maxHeight = 'calc(100% - 8px)';
     win.body.style.overflowY = 'auto';
-    renderCampaigns();
+    if (SITE.inviteOnly) renderCampaigns();
   });
 }
 
@@ -2211,9 +2256,9 @@ function setupDialog() {
     });
 
     win.body.append(
-      S.me.isAdmin ? h('fieldset', {}, h('legend', { text: 'Admin' }),
+      S.me.isAdmin && (SITE.inviteOnly || S.me.isOwner) ? h('fieldset', {}, h('legend', { text: 'Admin' }),
         h('div', { class: 'row' },
-          h('span', { class: 'grow small', text: S.me.isOwner ? 'Campaign codes and admins' : 'Campaign codes' }),
+          h('span', { class: 'grow small', text: !SITE.inviteOnly ? 'Manage admins' : S.me.isOwner ? 'Campaign codes and admins' : 'Campaign codes' }),
           h('button', { type: 'button', text: 'Admin Tools', onclick: () => { win.close(); adminDialog(); } }))) : null,
       h('fieldset', {}, h('legend', { text: 'Preferences' }),
         h('label', { class: 'check' }, soundBox, 'Play sounds'),
@@ -2235,6 +2280,9 @@ function setupDialog() {
     // Clear any stale session from a previous page load: keys live in memory only.
     await fetch('/api/logout', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   } catch { /* offline */ }
+  try {
+    Object.assign(SITE, await (await fetch('/api/config', { credentials: 'same-origin' })).json());
+  } catch { /* keep defaults */ }
   showSignOn();
 })();
 

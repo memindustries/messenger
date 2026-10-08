@@ -314,23 +314,24 @@ export function createApp({ config, db }) {
     'POST /api/register': async (req, res, body) => {
       const ip = clientIp(req);
       limiter.hit(`register:${ip}`, config.registrationsPerHourPerIp, 3600_000);
-      const { screenName, inviteCode } = body;
+      const { screenName } = body;
+      const inviteCode = typeof body.inviteCode === 'string' ? body.inviteCode.trim() : '';
       if (!validScreenName(screenName)) {
         throw new HttpError(400, 'Screen names are 3-16 letters or numbers, starting with a letter. Single spaces are OK.');
       }
       const authKey = requireAuthKey(body.authKey);
       const publicKey = parsePublicKey(body.publicKey);
       const wrappedKey = parseWrappedKey(body.wrappedKey);
-      if (typeof inviteCode !== 'string' || !inviteCode.trim() || inviteCode.length > 40) {
-        throw new HttpError(403, 'An invite code is required.');
-      }
+      if (body.adult !== true) throw new HttpError(400, 'You must be 18 or older and agree to the rules to sign up.');
+      if (inviteCode.length > 40) throw new HttpError(400, 'That invite code is invalid.');
+      if (config.inviteOnly && !inviteCode) throw new HttpError(403, 'An invite code is required.');
       const { salt, hash } = await hashAuthKey(authKey);
       const result = store.createUser({
-        inviteHash: sha256(normalizeInvite(inviteCode)),
+        inviteHash: inviteCode ? sha256(normalizeInvite(inviteCode)) : null,
         display: screenName,
         salt, hash, publicKey, wrappedKey, adminNames: config.adminNames,
       });
-      if (result.error === 'reserved') throw new HttpError(409, 'That screen name is reserved.');
+      if (result.error === 'reserved') throw new HttpError(409, 'That screen name is taken.');
       if (result.error === 'invite') throw new HttpError(403, 'That invite code is invalid, expired or already used.');
       if (result.error === 'taken') throw new HttpError(409, 'That screen name is taken.');
       const token = store.createSession(result.id, config.sessionTtlMs);
@@ -357,6 +358,11 @@ export function createApp({ config, db }) {
       sendJson(res, 200, {
         screenName: user.display, publicKey: user.public_key, wrappedKey: user.wrapped_key, ...roles(user),
       });
+    },
+
+    // What the sign-on screen needs to know before anyone is signed in.
+    'GET /api/config': async (req, res) => {
+      sendJson(res, 200, { inviteOnly: config.inviteOnly });
     },
 
     // Public so it's safe to call on page load; ends the session if there is one.
@@ -678,7 +684,7 @@ export function createApp({ config, db }) {
     },
   });
 
-  const PUBLIC_ROUTES = new Set(['POST /api/register', 'POST /api/login', 'POST /api/logout']);
+  const PUBLIC_ROUTES = new Set(['GET /api/config', 'POST /api/register', 'POST /api/login', 'POST /api/logout']);
 
   // -------------------------------------------------------------------------
 

@@ -38,6 +38,8 @@ export function loadConfig(env = process.env) {
     // Encrypted messages for offline buddies are held this long, then deleted. 0 disables.
     offlineTtlMs: num(env.OFFLINE_MESSAGE_TTL_DAYS, 7) * 86400_000,
     maxOfflinePerUser: num(env.MAX_OFFLINE_PER_USER, 500),
+    // Off by default: anyone can sign up. Set INVITE_ONLY=1 to require an invite code again.
+    inviteOnly: bool(env.INVITE_ONLY, false),
     registrationsPerHourPerIp: num(env.REGISTRATIONS_PER_HOUR, 30),
     // Screen names that are always admins (comma-separated). Reserved: they can only
     // be registered with an admin-issued invite. Set ADMIN_SCREEN_NAMES="" to disable.

@@ -164,16 +164,21 @@ export function createStore(db) {
     // adminNames: normalized screen names that are always admins. They're reserved:
     // only an admin-issued single-use invite (CLI / first-run code) can claim them,
     // so nobody can grab one with a campaign code or a friend's invite.
+    // inviteHash is null for open sign-up (no code given).
     createUser: tx(({ inviteHash, display, salt, hash, publicKey, wrappedKey, adminNames = [] }) => {
-      const invite = s.invite.get(inviteHash, Date.now());
-      if (!invite) return { error: 'invite' };
+      const invite = inviteHash === null ? null : s.invite.get(inviteHash, Date.now());
+      if (inviteHash !== null && !invite) return { error: 'invite' };
       const norm = normalizeScreenName(display);
       if (s.userByNorm.get(norm)) return { error: 'taken' };
+      // An invite printed by the server (first-run code, `npm run invite`).
+      const adminIssued = !!invite && invite.created_by === null && invite.max_uses === 1;
       const reserved = adminNames.includes(norm);
-      if (reserved && (invite.created_by !== null || invite.max_uses !== 1)) return { error: 'reserved' };
-      s.useInvite.run(inviteHash);
-      // The very first account runs the place, as do the configured admin names.
-      const isAdmin = reserved || s.userCount.get().n === 0 ? 1 : 0;
+      if (reserved && !adminIssued) return { error: 'reserved' };
+      if (invite) s.useInvite.run(inviteHash);
+      // Configured admin names run the place. So does the very first account, but only
+      // when created with the server's own code; with open sign-up a stranger could
+      // otherwise be first.
+      const isAdmin = reserved || (adminIssued && s.userCount.get().n === 0) ? 1 : 0;
       const r = s.insertUser.run(norm, display, salt, hash, publicKey, wrappedKey, isAdmin);
       return { id: Number(r.lastInsertRowid) };
     }),
