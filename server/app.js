@@ -15,6 +15,8 @@ const ROOM_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} '&!?.,#_-]{1,31}$/u;
 const MAX_PRIVATE_ROOM = 50;
 const MAX_OWNED_PRIVATE_ROOMS = 20;
 const MAX_BODY = 16 * 1024;
+const MAX_REPORT_BODY = 96 * 1024; // reports can carry recent messages as evidence
+const REPORT_CATEGORIES = ['child_safety', 'harassment', 'spam', 'illegal', 'other'];
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -194,14 +196,14 @@ export function createApp({ config, db }) {
     res.setHeader('Set-Cookie', parts.join('; '));
   }
 
-  async function readJson(req) {
+  async function readJson(req, limit = MAX_BODY) {
     const type = req.headers['content-type'] || '';
     if (!type.startsWith('application/json')) throw new HttpError(415, 'Expected JSON.');
     const chunks = [];
     let size = 0;
     for await (const chunk of req) {
       size += chunk.length;
-      if (size > MAX_BODY) throw new HttpError(413, 'Request too large.');
+      if (size > limit) throw new HttpError(413, 'Request too large.');
       chunks.push(chunk);
     }
     try {
@@ -350,6 +352,7 @@ export function createApp({ config, db }) {
       if (user) ok = await verifyAuthKey(authKey, user.auth_salt, user.auth_hash);
       else await verifyAuthKey(authKey, (await dummy).salt, (await dummy).hash);
       if (!ok) throw new HttpError(401, 'Incorrect screen name or password.');
+      if (user.banned_at) throw new HttpError(403, 'This screen name has been banned.');
       // Replace any session this browser already had.
       const old = sessionFromReq(req);
       if (old) store.deleteSession(old.tokenHash);
@@ -429,6 +432,7 @@ export function createApp({ config, db }) {
       limiter.hit(`request:${session.user.id}`, 30, 3600_000);
       const me = session.user;
       const other = otherUser(body.screenName, me.id);
+      if (other.banned_at) throw new HttpError(404, 'No user by that screen name.');
       if (store.areBuddies(me.id, other.id)) throw new HttpError(409, `${other.display} is already on your Buddy List.`);
       if (store.isBlocked(me.id, other.id)) throw new HttpError(409, `Unblock ${other.display} first.`);
       // If they've blocked us, pretend the request went through.
@@ -558,7 +562,7 @@ export function createApp({ config, db }) {
       const { room } = requireRoom(body.room, me.id);
       if (room.kind !== 'private') throw new HttpError(400, 'Anyone can join public rooms from the room list.');
       const other = otherUser(body.screenName, me.id);
-      if (!store.areBuddies(me.id, other.id)) throw new HttpError(403, 'You can only invite people on your Buddy List.');
+      if (other.banned_at || !store.areBuddies(me.id, other.id)) throw new HttpError(403, 'You can only invite people on your Buddy List.');
       if (store.isRoomBanned(room.id, other.id)) throw new HttpError(403, `${other.display} was removed from this room.`);
       if (store.membership(room.id, other.id)) throw new HttpError(409, `${other.display} is already in this room (or invited).`);
       if (store.roomMembers(room.id).length >= MAX_PRIVATE_ROOM) throw new HttpError(409, `Private rooms hold up to ${MAX_PRIVATE_ROOM} people.`);
@@ -628,6 +632,103 @@ export function createApp({ config, db }) {
       store.closeRoom(room.id);
       for (const id of people) hub.send(id, { t: 'roomClosed', room: room.id, name: room.name });
       sendJson(res, 200, { ok: true });
+    },
+  });
+
+  // Ban someone: everything that stops them using the service, plus telling the
+  // people and rooms around them.
+  function banUser(target, by, reason) {
+    const buddyIds = store.buddyIds(target.id);
+    for (const room of store.userRooms(target.id)) leaveRoom(room.id, target);
+    store.banUser(target.id, reason);
+    for (const id of buddyIds) hub.send(id, { t: 'buddyRemoved', screenName: target.display });
+    hub.disconnectUser(target.id, null, 4003);
+    store.resolveReports('target_id = ?', [target.id], `banned by ${by.display}`, by.display);
+    hub.sendAdmins({ t: 'reports', open: store.openReportCount() });
+  }
+
+  function cleanContext(context) {
+    if (!Array.isArray(context)) return [];
+    return context.slice(-50).flatMap((m) => {
+      if (!m || typeof m !== 'object' || typeof m.text !== 'string') return [];
+      return [{
+        from: typeof m.from === 'string' ? m.from.slice(0, 20) : '?',
+        text: m.text.slice(0, 2000),
+        ts: Number.isFinite(m.ts) ? m.ts : null,
+        flagged: m.flagged === true || undefined,
+      }];
+    });
+  }
+
+  function reportView(r) {
+    let context = [];
+    try {
+      context = JSON.parse(r.context);
+    } catch { /* keep empty */ }
+    return {
+      id: r.id, category: r.category, note: r.note, context, room: r.room_name,
+      reporter: r.reporter_name, target: r.target_name, targetBanned: !!r.target_banned_at,
+      createdAt: r.created_at, status: r.status, resolution: r.resolution, resolvedBy: r.resolved_by,
+    };
+  }
+
+  Object.assign(routes, {
+    // Anyone can report anyone. What they attach is their own copy of the
+    // conversation; for end-to-end encrypted chats it's the only copy that exists.
+    'POST /api/reports': async (req, res, body, session) => {
+      const me = session.user;
+      limiter.hit(`report:${me.id}`, 20, 3600_000);
+      const target = otherUser(body.screenName, me.id);
+      const category = REPORT_CATEGORIES.includes(body.category) ? body.category : null;
+      if (!category) throw new HttpError(400, 'Pick a reason for the report.');
+      const note = typeof body.note === 'string' ? body.note.trim().slice(0, 1000) : '';
+      const roomName = Number.isInteger(body.room) ? store.room(body.room)?.name ?? null : null;
+      const id = store.createReport({
+        reporterId: me.id, reporterName: me.display, targetId: target.id, targetName: target.display,
+        category, note, context: JSON.stringify(cleanContext(body.context)), roomName,
+      });
+      hub.sendAdmins({ t: 'reports', open: store.openReportCount(), urgent: category === 'child_safety' });
+      sendJson(res, 201, { id });
+    },
+
+    'GET /api/admin/reports': async (req, res, body, session) => {
+      requireAdmin(session);
+      sendJson(res, 200, { open: store.openReportCount(), reports: store.listReports().map(reportView) });
+    },
+
+    'POST /api/admin/reports/resolve': async (req, res, body, session) => {
+      requireAdmin(session);
+      if (!Number.isInteger(body.id)) throw new HttpError(400, 'Which report?');
+      const n = store.resolveReports('id = ?', [body.id], 'dismissed', session.user.display);
+      if (!n) throw new HttpError(404, 'That report is already resolved.');
+      hub.sendAdmins({ t: 'reports', open: store.openReportCount() });
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/admin/ban': async (req, res, body, session) => {
+      requireAdmin(session);
+      const me = session.user;
+      const target = otherUser(body.screenName, me.id);
+      if (isOwner(target)) throw new HttpError(403, `${target.display} can't be banned.`);
+      if (target.is_admin && !isOwner(me)) throw new HttpError(403, 'Only the site owner can ban an admin.');
+      if (target.banned_at) throw new HttpError(409, `${target.display} is already banned.`);
+      const reason = typeof body.reason === 'string' ? body.reason.trim().slice(0, 200) : '';
+      banUser(target, me, reason || `banned by ${me.display}`);
+      sendJson(res, 200, { ok: true });
+    },
+
+    'POST /api/admin/unban': async (req, res, body, session) => {
+      requireAdmin(session);
+      const target = typeof body.screenName === 'string' ? store.userByName(body.screenName) : null;
+      if (!target || !store.unbanUser(target.id)) throw new HttpError(404, 'That screen name isn\'t banned.');
+      sendJson(res, 200, { ok: true });
+    },
+
+    'GET /api/admin/banned': async (req, res, body, session) => {
+      requireAdmin(session);
+      sendJson(res, 200, {
+        banned: store.bannedUsers().map((u) => ({ screenName: u.display, bannedAt: u.banned_at, reason: u.ban_reason })),
+      });
     },
   });
 
@@ -737,7 +838,7 @@ export function createApp({ config, db }) {
       if (!session) throw new HttpError(401, 'Please sign on again.');
       limiter.hit(`api:${session.user.id}`, 300, 60_000);
     }
-    const body = req.method === 'GET' ? {} : await readJson(req);
+    const body = req.method === 'GET' ? {} : await readJson(req, key === 'POST /api/reports' ? MAX_REPORT_BODY : MAX_BODY);
     await route(req, res, body, session);
   }
 

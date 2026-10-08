@@ -32,6 +32,8 @@ const HELP = `Commands:
   users                                list screen names (admins marked *)
   make-admin <screen name>             let someone create/moderate public rooms
   remove-admin <screen name>
+  ban <screen name>                    block sign-in (in-app: Setup → Admin Tools)
+  unban <screen name>
   delete-user <screen name>            delete a user and all their data`;
 
 switch (cmd) {
@@ -75,6 +77,17 @@ switch (cmd) {
     console.log(`${u.display} is ${cmd === 'make-admin' ? 'now' : 'no longer'} an admin. (Their app shows admin controls after they next sign on.)`);
     break;
   }
+  case 'ban': {
+    const u = user(args.join(' '));
+    // Room departures also retire private-room keys they held.
+    for (const room of store.userRooms(u.id)) store.leaveRoom(room.id, u.id);
+    store.banUser(u.id, 'banned from the command line');
+    console.log(`${u.display} is banned. (If they're signed on, they're cut off within 30 seconds.)`);
+    break;
+  }
+  case 'unban':
+    console.log(store.unbanUser(user(args.join(' ')).id) ? 'Unbanned.' : 'They weren\'t banned.');
+    break;
   case 'delete-user': {
     const u = user(args.join(' '));
     // Hands off room ownership and retires private-room keys they held.

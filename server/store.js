@@ -49,7 +49,9 @@ export function createStore(db) {
     listAdmins: q('SELECT id, display, norm FROM users WHERE is_admin = 1 ORDER BY norm'),
 
     insertSession: q('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)'),
-    session: q('SELECT s.token_hash, s.expires_at, u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?'),
+    // Banned users' sessions simply stop working.
+    session: q(`SELECT s.token_hash, s.expires_at, u.* FROM sessions s JOIN users u ON u.id = s.user_id
+                WHERE s.token_hash = ? AND s.expires_at > ? AND u.banned_at IS NULL`),
     deleteSession: q('DELETE FROM sessions WHERE token_hash = ?'),
     deleteOtherSessions: q('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?'),
 
@@ -91,6 +93,10 @@ export function createStore(db) {
     purgeInvites: q(`DELETE FROM invites WHERE (label IS NULL AND (expires_at <= ?1 OR uses >= max_uses))
                      OR (label IS NOT NULL AND expires_at <= ?1 - 2592000000)`),
     purgeOffline: q('DELETE FROM offline_messages WHERE expires_at <= ?'),
+    // Resolved reports are kept 90 days; child-safety reports a year (evidence preservation).
+    purgeReports: q(`DELETE FROM reports WHERE status != 'open' AND (
+                       (category != 'child_safety' AND resolved_at <= ?1 - 7776000000)
+                       OR resolved_at <= ?1 - 31536000000)`),
   };
 
   const r = {
@@ -210,6 +216,35 @@ export function createStore(db) {
     revokeInvite: (code) => s.deleteInvite.run(sha256(normalizeInvite(code))).changes > 0,
     inviteExists: (code) => !!db.prepare('SELECT 1 FROM invites WHERE code_hash = ?').get(sha256(normalizeInvite(code))),
     listAdmins: () => s.listAdmins.all(),
+
+    // ---- Moderation ------------------------------------------------------------
+    createReport({ reporterId, reporterName, targetId, targetName, category, note, context, roomName }) {
+      const r = db.prepare(`INSERT INTO reports (reporter_id, reporter_name, target_id, target_name, category, note, context, room_name, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(reporterId, reporterName, targetId, targetName, category, note, context, roomName, Date.now());
+      return Number(r.lastInsertRowid);
+    },
+    // Open reports first (child safety at the top), then the most recent resolved ones.
+    listReports: () => db.prepare(`SELECT r.*, u.banned_at AS target_banned_at FROM reports r
+                                   LEFT JOIN users u ON u.id = r.target_id
+                                   ORDER BY (r.status = 'open') DESC, (r.category = 'child_safety') DESC, r.created_at DESC
+                                   LIMIT 200`).all(),
+    openReportCount: () => db.prepare("SELECT COUNT(*) AS n FROM reports WHERE status = 'open'").get().n,
+    resolveReports: (where, args, resolution, by) => db.prepare(
+      `UPDATE reports SET status = 'resolved', resolution = ?, resolved_by = ?, resolved_at = ? WHERE status = 'open' AND ${where}`,
+    ).run(resolution, by, Date.now(), ...args).changes,
+
+    // Sign-in blocked, sessions ended, buddy links and undelivered messages removed.
+    // The screen name stays taken. Room departures are handled by the caller.
+    banUser: tx((userId, reason) => {
+      db.prepare('UPDATE users SET banned_at = ?, ban_reason = ?, is_admin = 0 WHERE id = ?').run(Date.now(), reason, userId);
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+      db.prepare('DELETE FROM buddies WHERE owner_id = ?1 OR buddy_id = ?1').run(userId);
+      db.prepare('DELETE FROM buddy_requests WHERE from_id = ?1 OR to_id = ?1').run(userId);
+      db.prepare('DELETE FROM offline_messages WHERE from_id = ?').run(userId);
+    }),
+    unbanUser: (userId) => db.prepare('UPDATE users SET banned_at = NULL, ban_reason = NULL WHERE id = ?').run(userId).changes > 0,
+    bannedUsers: () => db.prepare('SELECT display, banned_at, ban_reason FROM users WHERE banned_at IS NOT NULL ORDER BY banned_at DESC').all(),
     setAdmin: (id, on) => s.setAdmin.run(on ? 1 : 0, id),
     // Make sure every configured admin name that exists is an admin.
     promoteAdmins(adminNames) {
@@ -332,6 +367,7 @@ export function createStore(db) {
       s.purgeSessions.run(now);
       s.purgeInvites.run(now);
       s.purgeOffline.run(now);
+      s.purgeReports.run(now);
     },
   };
 }

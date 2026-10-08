@@ -79,6 +79,25 @@ CREATE TABLE IF NOT EXISTS room_keys (
   envelope   TEXT NOT NULL,
   PRIMARY KEY (room_id, user_id, epoch)
 );
+-- User reports. Names and attached messages are copied in so a report survives
+-- even if either account is later deleted.
+CREATE TABLE IF NOT EXISTS reports (
+  id            INTEGER PRIMARY KEY,
+  reporter_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  target_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  reporter_name TEXT NOT NULL,
+  target_name   TEXT NOT NULL,
+  category      TEXT NOT NULL,
+  note          TEXT NOT NULL DEFAULT '',
+  context       TEXT NOT NULL DEFAULT '[]',
+  room_name     TEXT,
+  created_at    INTEGER NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'open',
+  resolution    TEXT,
+  resolved_by   TEXT,
+  resolved_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS reports_status ON reports(status);
 `;
 
 // Columns added after the first release; ALTER TABLE keeps existing data.
@@ -96,6 +115,8 @@ export function openDb(file) {
   addColumn(db, 'invites', 'max_uses', 'INTEGER NOT NULL DEFAULT 1');
   addColumn(db, 'invites', 'uses', 'INTEGER NOT NULL DEFAULT 0');
   addColumn(db, 'invites', 'label', 'TEXT'); // campaign codes only; personal codes stay hashed-only
+  addColumn(db, 'users', 'banned_at', 'INTEGER');
+  addColumn(db, 'users', 'ban_reason', 'TEXT');
   if (file !== ':memory:') {
     try { fs.chmodSync(file, 0o600); } catch { /* best effort */ }
   }

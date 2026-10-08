@@ -39,6 +39,12 @@ export class Hub {
     });
     this.pingTimer = setInterval(() => {
       for (const ws of this.wss.clients) {
+        // Catches bans and deletions made outside this process (the admin CLI).
+        const u = this.store.userById(ws.userId);
+        if (!u || u.banned_at) {
+          ws.close(u ? 4003 : 4001, u ? 'Banned' : 'Account removed');
+          continue;
+        }
         if (!ws.alive) {
           ws.terminate();
           continue;
@@ -107,16 +113,21 @@ export class Hub {
     for (const ws of this.wss?.clients ?? []) if (ws.tokenHash === tokenHash) ws.close(4001, 'Signed off');
   }
 
-  disconnectUser(userId, exceptTokenHash) {
+  disconnectUser(userId, exceptTokenHash, code = 4001) {
     for (const ws of this.conns.get(userId) ?? []) {
-      if (ws.tokenHash !== exceptTokenHash) ws.close(4001, 'Signed off');
+      if (ws.tokenHash !== exceptTokenHash) ws.close(code, code === 4003 ? 'Banned' : 'Signed off');
     }
+  }
+
+  sendAdmins(msg) {
+    for (const a of this.store.listAdmins()) this.send(a.id, msg);
   }
 
   onConnection(ws, session) {
     const user = session.user;
     ws.alive = true;
     ws.tokenHash = session.tokenHash;
+    ws.userId = user.id;
     ws.bucket = { tokens: 30, last: Date.now() };
     ws.on('pong', () => { ws.alive = true; });
 
@@ -147,6 +158,7 @@ export class Hub {
       // Re-check the session on every message so revocation takes effect.
       const fresh = this.store.userById(user.id);
       if (!fresh) return ws.close(4001, 'Account removed');
+      if (fresh.banned_at) return ws.close(4003, 'Banned');
       try {
         this.onMessage(ws, fresh, msg);
       } catch (err) {

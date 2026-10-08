@@ -560,3 +560,88 @@ test('open sign-up: no code needed, 18+ agreement required, reserved names and a
     open.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Reports and bans
+
+test('anyone can report; admins see reports (child safety first) and get notified', async () => {
+  const mod = await register('Report Mod');
+  app.store.setAdmin(app.store.userByName('Report Mod').id, true);
+  const victim = await register('Report Victim');
+  const creep = await register('Report Creep');
+  const wm = await connect(mod);
+
+  assert.equal((await req('POST', '/api/reports', { screenName: 'Report Creep', category: 'nonsense' }, victim.cookie)).status, 400);
+  assert.equal((await req('POST', '/api/reports', { screenName: 'Report Victim', category: 'spam' }, victim.cookie)).status, 400); // self
+  const r1 = await req('POST', '/api/reports', { screenName: 'Report Creep', category: 'spam', note: 'selling stuff' }, victim.cookie);
+  assert.equal(r1.status, 201);
+  const context = [{ from: 'Report Creep', text: 'you up? how old are you', ts: Date.now(), flagged: true }, { from: 'Report Victim', text: 'go away', ts: Date.now() }];
+  const r2 = await req('POST', '/api/reports', { screenName: 'reportcreep', category: 'child_safety', note: 'asked my age', context }, victim.cookie);
+  assert.equal(r2.status, 201);
+  const ev = await wm.next((m) => m.t === 'reports' && m.urgent);
+  assert.ok(ev.open >= 2);
+
+  // Non-admins can't read reports.
+  assert.equal((await req('GET', '/api/admin/reports', null, victim.cookie)).status, 403);
+  const { reports } = (await req('GET', '/api/admin/reports', null, mod.cookie)).body;
+  const mine = reports.filter((r) => r.target === 'Report Creep');
+  assert.equal(mine[0].category, 'child_safety');
+  assert.equal(mine[0].context[0].text, 'you up? how old are you');
+  assert.equal(mine[0].context[0].flagged, true);
+  assert.equal(mine[0].reporter, 'Report Victim');
+
+  // Dismiss one.
+  assert.equal((await req('POST', '/api/admin/reports/resolve', { id: r1.body.id }, mod.cookie)).status, 200);
+  assert.equal((await req('POST', '/api/admin/reports/resolve', { id: r1.body.id }, mod.cookie)).status, 404);
+  assert.ok(creep);
+  wm.close();
+});
+
+test('bans sign the person out, block sign-in, and remove them from buddies and rooms', async () => {
+  const mod = await register('Ban Mod');
+  app.store.setAdmin(app.store.userByName('Ban Mod').id, true);
+  const bad = await register('Ban Target');
+  const pal = await register('Ban Pal');
+  await befriend(bad, pal);
+  // In a private room together, plus a pending undelivered message from them.
+  const { id: room, raw } = await privateRoom(pal, 'Ban Room');
+  await req('POST', '/api/rooms/invite', { room, screenName: bad.name, epoch: 1, envelope: await wrapFor(pal, bad, room, 1, raw) }, pal.cookie);
+  await req('POST', '/api/rooms/respond', { room, accept: true }, bad.cookie);
+  app.store.queueOffline(app.store.userByName('Ban Pal').id, app.store.userByName('Ban Target').id, 'pending-msg-1', '{}', 60_000, 100);
+  await req('POST', '/api/reports', { screenName: 'Ban Target', category: 'harassment' }, pal.cookie);
+
+  const wb = await connect(bad);
+  const wp = await connect(pal);
+  // Plain users can't ban; nobody can ban the owner; admins can't ban admins.
+  assert.equal((await req('POST', '/api/admin/ban', { screenName: 'Ban Target' }, pal.cookie)).status, 403);
+  const owner = await registerMem();
+  assert.equal((await req('POST', '/api/admin/ban', { screenName: 'mem' }, mod.cookie)).status, 403);
+  const otherMod = await register('Other Mod');
+  app.store.setAdmin(app.store.userByName('Other Mod').id, true);
+  assert.equal((await req('POST', '/api/admin/ban', { screenName: 'Other Mod' }, mod.cookie)).status, 403);
+  assert.ok(owner && otherMod);
+
+  const closed = new Promise((resolve) => wb.on('close', (code) => resolve(code)));
+  assert.equal((await req('POST', '/api/admin/ban', { screenName: 'Ban Target', reason: 'harassment' }, mod.cookie)).status, 200);
+  assert.equal(await closed, 4003);
+  assert.equal((await wp.next((m) => m.t === 'buddyRemoved')).screenName, 'Ban Target');
+  assert.equal((await wp.next((m) => m.t === 'roomRekey')).room, room);
+
+  const target = app.store.userByName('Ban Target');
+  assert.ok(target.banned_at);
+  assert.equal((await req('GET', '/api/me', null, bad.cookie)).status, 401);
+  assert.equal((await req('POST', '/api/login', { screenName: 'Ban Target', authKey: bad.authKey })).status, 403);
+  assert.equal(app.store.areBuddies(target.id, app.store.userByName('Ban Pal').id), false);
+  assert.equal(app.store.membership(room, target.id), undefined);
+  assert.equal(app.store.offlineFor(app.store.userByName('Ban Pal').id).length, 0);
+  assert.equal((await req('POST', '/api/buddies/request', { screenName: 'Ban Target' }, pal.cookie)).status, 404);
+  // Their open reports were resolved by the ban.
+  const rep = (await req('GET', '/api/admin/reports', null, mod.cookie)).body.reports.find((r) => r.target === 'Ban Target');
+  assert.equal(rep.status, 'resolved');
+  assert.equal(rep.targetBanned, true);
+  assert.ok((await req('GET', '/api/admin/banned', null, mod.cookie)).body.banned.some((b) => b.screenName === 'Ban Target'));
+  // Unban: they can sign in again (with an empty buddy list).
+  assert.equal((await req('POST', '/api/admin/unban', { screenName: 'Ban Target' }, mod.cookie)).status, 200);
+  assert.equal((await req('POST', '/api/login', { screenName: 'Ban Target', authKey: bad.authKey })).status, 200);
+  wp.close();
+});

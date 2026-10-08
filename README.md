@@ -60,11 +60,46 @@ Your codes are listed with live sign-up counts, and **Revoke** stops a code inst
 
 Sign-ups are limited to 30 per IP address per hour (`REGISTRATIONS_PER_HOUR`). The limit is set this high because many phones on the same carrier can share one IP.
 
+## Reports and bans
+
+**Reporting (everyone).** Use **Report** in a chat window, in **Buddy Info**, or on a person in a chat room's member list.
+
+- Pick a reason and optionally describe what happened.
+- By default the recent messages on your screen are attached, with the reported person's lines highlighted. For encrypted chats, the reporter's copy is the only copy that exists, so this is how admins can see what happened.
+- **Also block** removes them from your list at the same time.
+
+**Reviewing (admins).**
+
+- A **⚑ open reports** notice appears on the Buddy List as soon as a report comes in. Child-safety reports also play a sound.
+- Reports are in **Setup → Admin Tools → Reports**, child-safety first. Each shows who reported whom, the note, and the attached messages.
+- From there you can **Ban** the person or **Dismiss** the report.
+
+**Banning (admins).** From a report, from a person in a chat room, or with **Admin Tools → Banned → Ban Someone…** A ban:
+
+- signs them out everywhere at once and blocks future sign-ins
+- removes them from every buddy list and room; private rooms get a fresh key
+- deletes their undelivered messages and closes their open reports
+- keeps their screen name taken
+
+Bans can be undone from the **Banned** list, but buddies and rooms don't come back. Only the owner can ban an admin, and nobody can ban the owner. From the command line: `npm run admin -- ban "name"` / `unban "name"`.
+
+**If a report involves a child.**
+
+- Don't download, screenshot or forward the material.
+- Ban the account.
+- In the US, report it to the NCMEC CyberTipline at <https://report.cybertip.org>. Elsewhere, use your country's equivalent (UK: IWF; others: INHOPE).
+- Child-safety reports are kept for a year as evidence. Other resolved reports are deleted after 90 days.
+
+Get a lawyer's view on your obligations where you live.
+
+People who are banned can still make a new screen name while sign-up is open. If someone keeps coming back, set `INVITE_ONLY=1` until it blows over.
+
 ## Admins
 
 | | Owner (`mem`) | Admins | Everyone |
 |---|---|---|---|
-| Make / revoke campaign codes | ✓ | ✓ | |
+| Review reports, ban and unban people | ✓ | ✓ | |
+| Make / revoke campaign codes (invite-only mode) | ✓ | ✓ | |
 | Create and moderate public rooms | ✓ | ✓ | |
 | Make someone an admin, or remove one | ✓ | | |
 

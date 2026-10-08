@@ -523,6 +523,7 @@ async function startSession(me) {
   try {
     await loadBuddies();
     await loadRooms();
+    if (me.isAdmin) loadReportCount();
   } catch (err) {
     if (err.status === 401) return signOff('Please sign on again.');
   }
@@ -595,6 +596,7 @@ function connect() {
   });
   ws.addEventListener('close', async (e) => {
     if (S !== state || state.signingOff || state.ws !== ws) return;
+    if (e.code === 4003) return signOff('This screen name has been banned.', { skipServer: true });
     if (e.code === 4001) return signOff('You were signed off (signed on elsewhere, password changed, or account removed).', { skipServer: true });
     setConn('Connection lost. Reconnecting…');
     try {
@@ -666,12 +668,27 @@ async function onServerMessage(msg) {
     case 'roomClosed':
     case 'roomRemoved':
       return onRoomEvent(msg);
+    case 'reports':
+      S.openReports = msg.open;
+      renderReportsBanner();
+      adminRefresh();
+      if (msg.urgent) {
+        sounds.imIn();
+        if (isSmall()) toast('⚠ New child-safety report. Tap to review.', () => adminDialog());
+      }
+      return undefined;
     case 'roles': {
       // The owner changed our admin status; takes effect immediately.
       const was = S.me.isAdmin;
       Object.assign(S.me, { isAdmin: msg.isAdmin, isOwner: msg.isOwner });
+      if (msg.isAdmin) loadReportCount();
+      else {
+        S.openReports = 0;
+        renderReportsBanner();
+      }
       if (was !== msg.isAdmin) {
         dialogs.get('admin')?.close();
+      dialogs.get('ban')?.close();
         alertBox('Admin', msg.isAdmin
           ? `You're now an admin. You can create and moderate public chat rooms${SITE.inviteOnly ? ' and make campaign codes (Setup → Admin Tools)' : ''}.`
           : 'You are no longer an admin.');
@@ -813,6 +830,21 @@ let blHeadName;
 let blAway;
 let blConn;
 
+let blReports;
+function renderReportsBanner() {
+  if (!blReports || !S) return;
+  const n = S.openReports ?? 0;
+  blReports.hidden = !(S.me.isAdmin && n > 0);
+  blReports.textContent = `⚑ ${n} open report${n === 1 ? '' : 's'} · Review`;
+}
+
+async function loadReportCount() {
+  try {
+    S.openReports = (await api('GET', '/api/admin/reports')).open;
+    renderReportsBanner();
+  } catch { /* not an admin any more */ }
+}
+
 function setConn(text) {
   if (blConn) blConn.textContent = text;
 }
@@ -825,6 +857,7 @@ function buildBuddyList() {
   S.buddyWin = win;
   blHeadName = h('div', { class: 'me', text: S.me.screenName });
   blAway = h('div', { class: 'away-banner', hidden: true });
+  blReports = h('button', { type: 'button', class: 'reports-banner', hidden: true, onclick: () => adminDialog() });
   blTree = h('div', { class: 'bl-tree sunken', role: 'tree', tabindex: '0' });
   blConn = h('div', { class: 'conn muted' });
   const btn = (text, onclick, title) => h('button', { type: 'button', text, onclick, title });
@@ -832,6 +865,7 @@ function buildBuddyList() {
     h('div', { class: 'bl-head sunken' }, h('img', { src: '/img/buddy.svg', alt: '' }),
       h('div', {}, blHeadName, h('div', { class: 'small muted', text: '🔒 Encrypted' }))),
     blAway,
+    blReports,
     blTree,
     blConn,
     h('div', { class: 'bl-buttons' },
@@ -1032,6 +1066,7 @@ function createIm(buddy, { background = false } = {}) {
   lock.addEventListener('click', () => { if (b) buddyInfo(b); });
   win.body.append(
     h('div', { class: 'im-bar' }, lock, h('span', { class: 'grow' }),
+      h('button', { type: 'button', text: 'Report', onclick: () => { if (b) reportDialog(b.screenName, imContext(b.norm)); } }),
       h('button', { type: 'button', text: 'Info', onclick: () => { if (b) buddyInfo(b); } })),
     transcript, status,
     h('div', { class: 'compose' }, input, send));
@@ -1091,6 +1126,7 @@ function createIm(buddy, { background = false } = {}) {
 
   im = {
     win, input,
+    lines: [], // what's on screen, so a report can include it
     updateTask() {
       const n = S?.unread.get(norm) ?? 0;
       win.setTaskLabel(b ? `${b.screenName}${n ? ` (${n})` : ''}` : win.taskBtn?.textContent);
@@ -1102,6 +1138,8 @@ function createIm(buddy, { background = false } = {}) {
         ': ',
         h('span', { class: 'text', text }));
       transcript.append(line);
+      im.lines.push({ from: who, text, ts });
+      if (im.lines.length > 200) im.lines.shift();
       if (stick || side === 'me') scrollDown();
       if (side === 'them') {
         typingOn = false;
@@ -1529,6 +1567,11 @@ function roomMemberDialog(roomId, member, canModerate) {
               } catch (err) { alertBox('Add Buddy', err.message); }
             },
           }),
+        h('button', {
+          type: 'button', text: 'Report',
+          onclick: () => { win.close(); reportDialog(member.screenName, roomContext(roomId, member.screenName)); },
+        }),
+        S.me.isAdmin ? h('button', { type: 'button', text: 'Ban', onclick: () => { win.close(); banDialog(member.screenName); } }) : null,
         canModerate ? h('button', {
           type: 'button', text: 'Remove from room',
           onclick: async () => {
@@ -1927,6 +1970,7 @@ function buddyInfo(buddy) {
             } catch (err) { alertBox('Remove', err.message); }
           },
         }),
+        h('button', { type: 'button', text: 'Report', onclick: () => { win.close(); reportDialog(b.screenName, imContext(b.norm)); } }),
         h('button', {
           type: 'button', text: 'Block',
           onclick: async () => {
@@ -2039,7 +2083,7 @@ const CAMPAIGN_DURATIONS = [
 ];
 
 function adminDialog() {
-  if (!S.me.isAdmin || (!SITE.inviteOnly && !S.me.isOwner)) return;
+  if (!S.me.isAdmin) return;
   dialog('admin', { title: 'Admin Tools', cls: 'dialog wide' }, (win) => {
     // -- Campaign codes
     const code = h('input', { type: 'text', maxlength: '32', placeholder: 'Leave blank for a random code', autocapitalize: 'characters', spellcheck: 'false' });
@@ -2152,6 +2196,8 @@ function adminDialog() {
 
     // Campaign codes only matter while sign-up needs a code.
     win.body.append(
+      reportsSection(),
+      bannedSection(),
       SITE.inviteOnly ? h('fieldset', {}, h('legend', { text: 'Campaign codes' }),
         h('p', { class: 'hint', text: 'One code many people can use, like in an Instagram story. Set how many sign-ups it allows and how long it lasts. Revoke it any time if it spreads further than you wanted.' }),
         form) : null,
@@ -2162,6 +2208,197 @@ function adminDialog() {
     win.body.style.overflowY = 'auto';
     if (SITE.inviteOnly) renderCampaigns();
   });
+}
+
+// ---- Reports & bans ------------------------------------------------------------
+
+const REPORT_REASONS = [
+  ['child_safety', 'Child safety: involves a minor, or sexual content with a minor'],
+  ['harassment', 'Harassment, threats or hate'],
+  ['spam', 'Spam or a scam'],
+  ['illegal', 'Other illegal activity'],
+  ['other', 'Something else'],
+];
+const reasonLabel = (c) => (REPORT_REASONS.find(([k]) => k === c)?.[1] ?? c).split(':')[0];
+
+// Recent lines from an IM or room, with the reported person's messages flagged.
+function imContext(norm) {
+  const lines = S.ims.get(norm)?.lines ?? [];
+  return { context: lines.slice(-50).map((l) => ({ ...l, flagged: C.normalizeScreenName(l.from) === norm })), where: 'from this conversation' };
+}
+
+function roomContext(roomId, screenName) {
+  const norm = C.normalizeScreenName(screenName);
+  const lines = (S.roomLogs.get(roomId) ?? []).filter((l) => !l.sys).slice(-50);
+  return {
+    context: lines.map((l) => ({ from: l.from, text: l.text, ts: l.ts, flagged: C.normalizeScreenName(l.from) === norm })),
+    where: `from "${S.rooms.get(roomId)?.name ?? 'this room'}"`,
+    room: roomId,
+  };
+}
+
+function reportDialog(screenName, { context = [], where = '', room = null } = {}) {
+  const norm = C.normalizeScreenName(screenName);
+  dialog(`report:${norm}`, { title: `Report ${screenName}` }, (win) => {
+    const reason = h('select', {}, h('option', { value: '', text: 'Choose a reason…' }),
+      ...REPORT_REASONS.map(([value, text]) => h('option', { value, text })));
+    const note = h('textarea', { rows: '3', maxlength: '1000', placeholder: 'What happened? (optional)' });
+    const attach = h('input', { type: 'checkbox', checked: context.length > 0, disabled: context.length === 0 });
+    const alsoBlock = h('input', { type: 'checkbox' });
+    const childHelp = h('p', { class: 'banner-warn small', hidden: true },
+      'If a child is in immediate danger, call your local emergency number. In the US you can also report directly to the NCMEC CyberTipline at report.cybertip.org.');
+    reason.addEventListener('change', () => { childHelp.hidden = reason.value !== 'child_safety'; });
+    const msg = h('p', { class: 'small error', role: 'status' });
+    const send = h('button', { type: 'button', text: 'Send Report' });
+    send.addEventListener('click', async () => {
+      if (!reason.value) {
+        msg.textContent = 'Choose a reason.';
+        return;
+      }
+      send.disabled = true;
+      try {
+        await api('POST', '/api/reports', {
+          screenName, category: reason.value, note: note.value, room, context: attach.checked ? context : [],
+        });
+        if (alsoBlock.checked) {
+          await api('POST', '/api/block', { screenName }).catch(() => {});
+          if (!S.blocked.includes(screenName)) S.blocked.push(screenName);
+        }
+        win.body.replaceChildren(
+          h('p', { text: `Thanks. Your report about ${screenName} was sent to the admins.` }),
+          h('div', { class: 'row end' }, h('button', { type: 'button', text: 'Close', onclick: () => win.close() })));
+      } catch (err) {
+        msg.textContent = err.message;
+        send.disabled = false;
+      }
+    });
+    win.body.append(
+      h('label', { class: 'field' }, 'Reason', reason),
+      childHelp,
+      h('label', { class: 'field' }, 'Details', note),
+      h('label', { class: 'check' }, attach,
+        context.length ? `Include the last ${context.length === 1 ? 'message' : `${context.length} messages`} ${where}` : 'No messages on screen to include'),
+      h('p', { class: 'hint', text: 'Admins will see the messages exactly as they appear on your screen. For encrypted chats, your copy is the only one that exists.' }),
+      h('label', { class: 'check' }, alsoBlock, `Also block ${screenName}`),
+      msg,
+      h('div', { class: 'row end' }, send, h('button', { type: 'button', text: 'Cancel', onclick: () => win.close() })));
+  });
+}
+
+function banDialog(screenName, { onDone } = {}) {
+  dialog('ban', { title: 'Ban' }, (win) => {
+    const name = h('input', { type: 'text', maxlength: '20', value: screenName ?? '', placeholder: 'Screen name', spellcheck: 'false', autocapitalize: 'off' });
+    const reason = h('input', { type: 'text', maxlength: '200', placeholder: 'Reason (only admins see this)' });
+    const msg = h('p', { class: 'small error', role: 'status' });
+    const go = h('button', { type: 'button', text: 'Ban' });
+    go.addEventListener('click', async () => {
+      if (!name.value.trim()) return;
+      go.disabled = true;
+      try {
+        await api('POST', '/api/admin/ban', { screenName: name.value.trim(), reason: reason.value });
+        win.close();
+        onDone?.();
+        adminRefresh();
+      } catch (err) {
+        msg.textContent = err.message;
+        go.disabled = false;
+      }
+    });
+    win.body.append(
+      h('p', { class: 'hint', text: 'Banning signs them out everywhere, blocks sign-in, removes them from every buddy list and room, and deletes messages of theirs that hadn\'t been delivered yet. Their screen name stays taken. You can undo it later.' }),
+      h('label', { class: 'field' }, 'Screen name', name),
+      h('label', { class: 'field' }, 'Reason', reason),
+      msg,
+      h('div', { class: 'row end' }, go, h('button', { type: 'button', text: 'Cancel', onclick: () => win.close() })));
+  });
+}
+
+// Sections of Admin Tools that reload when something changes (a new report, a ban).
+const adminRefreshers = new Set();
+function adminRefresh() {
+  for (const r of adminRefreshers) {
+    if (r.el.isConnected) r.run();
+    else adminRefreshers.delete(r); // Admin Tools was closed
+  }
+}
+
+function reportsSection() {
+  const list = h('div', { class: 'reports' }, h('div', { class: 'muted small', text: 'Loading…' }));
+  const render = async () => {
+    let data;
+    try {
+      data = await api('GET', '/api/admin/reports');
+    } catch (err) {
+      list.replaceChildren(h('div', { class: 'error small', text: err.message }));
+      return;
+    }
+    S.openReports = data.open;
+    renderReportsBanner();
+    if (!data.reports.length) {
+      list.replaceChildren(h('div', { class: 'muted small', text: 'No reports. 🎉' }));
+      return;
+    }
+    list.replaceChildren(...data.reports.map((r) => {
+      const urgent = r.category === 'child_safety';
+      const when = new Date(r.createdAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+      return h('div', { class: `report ${r.status}${urgent ? ' urgent' : ''}` },
+        h('div', { class: 'report-head' }, h('strong', { text: `${urgent ? '⚠ ' : ''}${reasonLabel(r.category)}` }),
+          h('span', { class: 'small muted', text: ` · ${when}` })),
+        h('div', {}, h('strong', { text: r.reporter }), ' reported ', h('strong', { text: r.target }),
+          r.room ? ` in "${r.room}"` : '', r.targetBanned ? h('span', { class: 'tag-banned', text: ' BANNED' }) : null),
+        r.note ? h('div', { class: 'report-note', text: `“${r.note}”` }) : null,
+        urgent && r.status === 'open' ? h('div', { class: 'banner-warn small' },
+          "Don't download, screenshot or forward anything here. Ban the account, then report it to the NCMEC CyberTipline (report.cybertip.org) in the US. This report is kept for a year as evidence.") : null,
+        r.context.length ? h('details', {},
+          h('summary', { text: `${r.context.length} message${r.context.length === 1 ? '' : 's'} attached by the reporter` }),
+          h('div', { class: 'report-context sunken' }, ...r.context.map((m) => h('div', { class: `line${m.flagged ? ' flagged' : ''}` },
+            h('span', { class: 'who', text: m.from }),
+            m.ts ? h('span', { class: 'ts', text: ` (${new Date(m.ts).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })})` }) : null,
+            ': ', h('span', { class: 'text', text: m.text }))))) : null,
+        r.status === 'open' ? h('div', { class: 'row end' },
+          r.targetBanned ? null : h('button', { type: 'button', text: `Ban ${r.target}`, onclick: () => banDialog(r.target) }),
+          h('button', {
+            type: 'button', text: 'Dismiss',
+            onclick: async () => {
+              try {
+                await api('POST', '/api/admin/reports/resolve', { id: r.id });
+                render();
+              } catch (err) { alertBox('Reports', err.message); }
+            },
+          }))
+          : h('div', { class: 'small muted', text: `Resolved: ${r.resolution}${r.resolvedBy && !String(r.resolution).includes(r.resolvedBy) ? ` (${r.resolvedBy})` : ''}` }));
+    }));
+  };
+  render();
+  adminRefreshers.add({ el: list, run: render });
+  return h('fieldset', {}, h('legend', { text: 'Reports' }), list);
+}
+
+function bannedSection() {
+  const list = h('div', { class: 'list sunken' });
+  const render = async () => {
+    try {
+      const { banned } = await api('GET', '/api/admin/banned');
+      list.replaceChildren(...(banned.length ? banned.map((b) => h('div', { class: 'row' },
+        h('div', { class: 'grow' }, h('div', { text: b.screenName }), b.reason ? h('div', { class: 'small muted', text: b.reason }) : null),
+        h('button', {
+          type: 'button', text: 'Unban',
+          onclick: async () => {
+            if (!confirm(`Let ${b.screenName} sign in again? Their buddy list and rooms won't come back.`)) return;
+            try {
+              await api('POST', '/api/admin/unban', { screenName: b.screenName });
+              render();
+            } catch (err) { alertBox('Unban', err.message); }
+          },
+        }))) : [h('div', { class: 'muted small', text: 'Nobody is banned.' })]));
+    } catch (err) {
+      list.replaceChildren(h('div', { class: 'error small', text: err.message }));
+    }
+  };
+  render();
+  adminRefreshers.add({ el: list, run: render });
+  return h('fieldset', {}, h('legend', { text: 'Banned' }), list,
+    h('div', { class: 'row end' }, h('button', { type: 'button', text: 'Ban Someone…', onclick: () => banDialog('') })));
 }
 
 function setupDialog() {
@@ -2256,9 +2493,9 @@ function setupDialog() {
     });
 
     win.body.append(
-      S.me.isAdmin && (SITE.inviteOnly || S.me.isOwner) ? h('fieldset', {}, h('legend', { text: 'Admin' }),
+      S.me.isAdmin ? h('fieldset', {}, h('legend', { text: 'Admin' }),
         h('div', { class: 'row' },
-          h('span', { class: 'grow small', text: !SITE.inviteOnly ? 'Manage admins' : S.me.isOwner ? 'Campaign codes and admins' : 'Campaign codes' }),
+          h('span', { class: 'grow small', text: ['Reports and bans', S.me.isOwner ? 'admins' : '', SITE.inviteOnly ? 'campaign codes' : ''].filter(Boolean).join(', ') }),
           h('button', { type: 'button', text: 'Admin Tools', onclick: () => { win.close(); adminDialog(); } }))) : null,
       h('fieldset', {}, h('legend', { text: 'Preferences' }),
         h('label', { class: 'check' }, soundBox, 'Play sounds'),
